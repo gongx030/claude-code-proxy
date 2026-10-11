@@ -121,8 +121,17 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
     }
 }
 
+/// The lite lane requires `parallel_tool_calls: false` (the backend rejects
+/// `true` with 400 `unsupported_value`), so every tool call there costs its
+/// own assistant turn. With `codex.fullLane` / `CCP_CODEX_FULL_LANE`, models
+/// that also exist on the full lane use it and keep parallel tool calls; luna
+/// models stay on lite (see [`full_lane_web_search_model`]).
 pub fn uses_responses_lite(model: &str) -> bool {
-    matches!(
+    uses_responses_lite_with_full_lane(model, config::codex_full_lane())
+}
+
+fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
+    let lite_family = matches!(
         model,
         "gpt-5.6-luna"
             | "gpt-5.6-sol"
@@ -131,7 +140,9 @@ pub fn uses_responses_lite(model: &str) -> bool {
             | "gpt-6-luna"
             | "gpt-6-sol"
             | "gpt-6.1-sol"
-    )
+    );
+    let lite_only = full_lane_web_search_model(model) != model;
+    lite_family && (lite_only || !full_lane)
 }
 
 /// Luna models exist only behind the Responses Lite lane; the full
@@ -175,6 +186,24 @@ mod tests {
         assert_eq!(full_lane_web_search_model("gpt-5.4"), "gpt-5.4");
         assert_eq!(full_lane_web_search_model("gpt-6-luna"), "gpt-6-sol");
         assert_eq!(full_lane_web_search_model("gpt-6-sol"), "gpt-6-sol");
+    }
+
+    #[test]
+    fn full_lane_moves_every_lite_model_except_luna() {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+        ] {
+            assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
+            assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
+        for model in ["gpt-5.6-luna", "gpt-6-luna"] {
+            assert!(uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
+        assert!(!uses_responses_lite_with_full_lane("gpt-5.4", false));
     }
 
     #[test]
