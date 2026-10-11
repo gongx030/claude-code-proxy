@@ -61,7 +61,7 @@ fn translate_request_with_override(
             Some("model_not_supported"),
         )
     })?;
-    let use_responses_lite = uses_responses_lite(&resolved.model);
+    let use_responses_lite = uses_responses_lite(&resolved.model, false);
 
     let messages = object
         .get("messages")

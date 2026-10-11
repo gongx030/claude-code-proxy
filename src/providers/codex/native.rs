@@ -11,6 +11,7 @@ use http::{HeaderMap, HeaderName, StatusCode};
 use serde_json::{Map, Value, json};
 
 use crate::anthropic::sse::parse_sse_events;
+use crate::config;
 use crate::provider::RequestContext;
 use crate::traffic::{
     MAX_SSE_CAPTURE_BYTES, MAX_STREAM_CAPTURE_EVENT_BYTES, MAX_STREAM_CAPTURE_EVENTS,
@@ -41,7 +42,7 @@ impl CodexNativeBackend {
     }
 
     pub async fn handle(&self, mut body: Value, ctx: RequestContext) -> Response {
-        let resolved = match shape_native_request(&mut body) {
+        let resolved = match shape_native_request(&mut body, config::codex_full_lane()) {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
@@ -112,7 +113,7 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
 }
 
 #[allow(clippy::result_large_err)]
-fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
+fn shape_native_request(body: &mut Value, full_lane: bool) -> Result<NativeResolved, Response> {
     let requested = validate_native_request_model(body)?;
     let object = body
         .as_object_mut()
@@ -130,7 +131,7 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
     }
 
     Ok(NativeResolved {
-        use_responses_lite: uses_responses_lite(&model) && !hosted_web_search,
+        use_responses_lite: uses_responses_lite(&model, full_lane) && !hosted_web_search,
         model,
         stream: object
             .get("stream")
@@ -684,21 +685,21 @@ mod tests {
 
     #[test]
     fn native_request_requires_object_and_model() {
-        assert!(shape_native_request(&mut json!([])).is_err());
-        assert!(shape_native_request(&mut json!({})).is_err());
-        assert!(shape_native_request(&mut json!({"model": 7})).is_err());
+        assert!(shape_native_request(&mut json!([]), false).is_err());
+        assert!(shape_native_request(&mut json!({}), false).is_err());
+        assert!(shape_native_request(&mut json!({"model": 7}), false).is_err());
     }
 
     #[test]
     fn native_request_resolves_alias_and_fast_tier() {
         let mut body = request(json!({"model":"claude-opus-5","input":[]}));
-        let resolved = shape_native_request(&mut body).unwrap();
+        let resolved = shape_native_request(&mut body, false).unwrap();
         assert_eq!(resolved.model, "gpt-6-sol");
         assert_eq!(body["model"], "gpt-6-sol");
         assert!(resolved.use_responses_lite);
 
         let mut fast = request(json!({"model":"gpt-5.4-fast","input":[]}));
-        let resolved = shape_native_request(&mut fast).unwrap();
+        let resolved = shape_native_request(&mut fast, false).unwrap();
         assert_eq!(resolved.model, "gpt-5.4");
         assert_eq!(fast["service_tier"], "priority");
     }
@@ -711,7 +712,7 @@ mod tests {
                 "input":[],
                 "parallel_tool_calls":parallel
             }));
-            shape_native_request(&mut body).unwrap();
+            shape_native_request(&mut body, false).unwrap();
             assert_eq!(body["parallel_tool_calls"], parallel);
         }
     }
@@ -723,7 +724,7 @@ mod tests {
             "service_tier":"flex",
             "input":[]
         }));
-        shape_native_request(&mut body).unwrap();
+        shape_native_request(&mut body, false).unwrap();
         assert_eq!(body["service_tier"], "flex");
     }
 
@@ -735,7 +736,7 @@ mod tests {
                 "tools":[{"type":tool_type}],
                 "input":[]
             }));
-            let resolved = shape_native_request(&mut body).unwrap();
+            let resolved = shape_native_request(&mut body, false).unwrap();
             assert_eq!(resolved.model, "gpt-5.6-sol");
             assert!(!resolved.use_responses_lite);
         }
