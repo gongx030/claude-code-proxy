@@ -192,7 +192,8 @@ impl CodexProvider {
                 ctx.traffic.as_deref(),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let use_responses_lite =
+            apply_model_lane_for_request(&mut resolved.model, &body, config::codex_full_lane());
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -571,7 +572,8 @@ impl Provider for CodexProvider {
                 ),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let use_responses_lite =
+            apply_model_lane_for_request(&mut resolved.model, &body, config::codex_full_lane());
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -613,12 +615,16 @@ impl Provider for CodexProvider {
 /// run on the full Responses API (the lite lane rejects hosted tools), and
 /// lite-only models like gpt-5.6-luna don't exist there, so such requests
 /// are upgraded to a full-lane model. Returns whether to use the lite lane.
-fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> bool {
+fn apply_model_lane_for_request(
+    model: &mut String,
+    body: &MessagesRequest,
+    full_lane: bool,
+) -> bool {
     if has_hosted_web_search(body) {
         *model = full_lane_web_search_model(model).to_string();
         return false;
     }
-    uses_responses_lite(model)
+    uses_responses_lite(model, full_lane)
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
@@ -1889,7 +1895,7 @@ mod tests {
             ("gpt-5.4", "gpt-5.4"),
         ] {
             let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
+            let lite = apply_model_lane_for_request(&mut model, &body, false);
             assert!(!lite, "{resolved} with web_search must use the full lane");
             assert_eq!(model, expected);
         }
@@ -1908,7 +1914,7 @@ mod tests {
             ("gpt-5.4", false),
         ] {
             let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
+            let lite = apply_model_lane_for_request(&mut model, &body, false);
             assert_eq!(model, resolved, "model must not change without web_search");
             assert_eq!(lite, lite_expected);
         }

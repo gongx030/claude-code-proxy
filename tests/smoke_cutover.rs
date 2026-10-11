@@ -1693,6 +1693,7 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
     let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+    let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "0");
     let compact_response = call_messages_body(json!({
         "model": "gpt-5.6-sol",
         "max_tokens": 64,

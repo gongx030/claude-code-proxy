@@ -126,11 +126,8 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
 /// own assistant turn. With `codex.fullLane` / `CCP_CODEX_FULL_LANE`, models
 /// that also exist on the full lane use it and keep parallel tool calls; luna
 /// models stay on lite (see [`full_lane_web_search_model`]).
-pub fn uses_responses_lite(model: &str) -> bool {
-    uses_responses_lite_with_full_lane(model, config::codex_full_lane())
-}
-
-fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
+/// `full_lane` is `config::codex_full_lane()`, read by the request handler.
+pub fn uses_responses_lite(model: &str, full_lane: bool) -> bool {
     let lite_family = matches!(
         model,
         "gpt-5.6-luna"
@@ -197,13 +194,13 @@ mod tests {
             "gpt-6-sol",
             "gpt-6.1-sol",
         ] {
-            assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
-            assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
+            assert!(uses_responses_lite(model, false), "{model}");
+            assert!(!uses_responses_lite(model, true), "{model}");
         }
         for model in ["gpt-5.6-luna", "gpt-6-luna"] {
-            assert!(uses_responses_lite_with_full_lane(model, true), "{model}");
+            assert!(uses_responses_lite(model, true), "{model}");
         }
-        assert!(!uses_responses_lite_with_full_lane("gpt-5.4", false));
+        assert!(!uses_responses_lite("gpt-5.4", false));
     }
 
     #[test]
@@ -251,9 +248,9 @@ mod tests {
 
     #[test]
     fn gpt_6_models_use_responses_lite() {
-        assert!(uses_responses_lite("gpt-6-sol"));
-        assert!(uses_responses_lite("gpt-6-luna"));
-        assert!(uses_responses_lite("gpt-6.1-sol"));
+        assert!(uses_responses_lite("gpt-6-sol", false));
+        assert!(uses_responses_lite("gpt-6-luna", false));
+        assert!(uses_responses_lite("gpt-6.1-sol", false));
     }
 
     #[test]
