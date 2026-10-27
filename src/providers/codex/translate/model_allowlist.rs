@@ -18,6 +18,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-luna",
     "gpt-6-sol",
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -137,6 +138,7 @@ pub fn uses_responses_lite(model: &str, full_lane: bool) -> bool {
             | "gpt-6-luna"
             | "gpt-6-sol"
             | "gpt-6.1-sol"
+            | "gpt-6.1-terra"
     );
     let lite_only = full_lane_web_search_model(model) != model;
     lite_family && (lite_only || !full_lane)
