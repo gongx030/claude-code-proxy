@@ -1,4 +1,5 @@
 pub mod auth;
+pub(crate) mod cache_key;
 pub mod chat_completions;
 pub mod client;
 pub mod compaction;
@@ -198,10 +199,25 @@ impl CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
+        // Re-read per request like the sibling Codex settings; startup validates it.
+        let cache_key_mode = match config::codex_prompt_cache_key_mode() {
+            Ok(mode) => mode,
+            Err(error) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    error.to_string(),
+                );
+            }
+        };
         let mut translated = match translate_request(
             &body,
             TranslateOptions {
-                session_id: ctx.session_id.clone(),
+                prompt_cache_key: cache_key::resolve(
+                    cache_key_mode,
+                    ctx.session_id.as_deref(),
+                    conversation_identity.as_ref(),
+                ),
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
                 use_responses_lite,
@@ -323,6 +339,14 @@ impl CodexProvider {
                     serde_json::json!(continuation.candidate().input_delta.as_ref().map(Vec::len)),
                 ),
                 ("turnId".to_string(), serde_json::json!(turn_id)),
+                (
+                    "promptCacheKeyMode".to_string(),
+                    serde_json::json!(cache_key_mode.as_str()),
+                ),
+                (
+                    "identityKind".to_string(),
+                    serde_json::json!(cache_key::identity_kind(conversation_identity.as_ref())),
+                ),
             ])),
         );
 
@@ -621,7 +645,7 @@ impl Provider for CodexProvider {
         let translated = match translate_request(
             &body,
             TranslateOptions {
-                session_id: None,
+                prompt_cache_key: None,
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
                 use_responses_lite,
@@ -2076,7 +2100,7 @@ mod tests {
         let request_body = translate_request(
             &body,
             TranslateOptions {
-                session_id: None,
+                prompt_cache_key: None,
                 service_tier: None,
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: true,
