@@ -256,7 +256,7 @@ pub struct ResponsesWebSearchFilters {
 }
 
 pub struct TranslateOptions {
-    pub session_id: Option<String>,
+    pub prompt_cache_key: Option<String>,
     pub service_tier: Option<ServiceTier>,
     pub model: String,
     pub use_responses_lite: bool,
@@ -462,7 +462,7 @@ pub fn translate_openai_compatible_request(
     translate_request_inner(
         req,
         TranslateOptions {
-            session_id,
+            prompt_cache_key: session_id,
             service_tier: None,
             model,
             use_responses_lite: false,
@@ -563,9 +563,7 @@ fn translate_request_inner(
         }
     }
 
-    if let Some(sid) = opts.session_id {
-        out.prompt_cache_key = Some(sid);
-    }
+    out.prompt_cache_key = opts.prompt_cache_key;
 
     if apply_codex_config {
         let service_tier = resolve_service_tier(opts.service_tier)?;
@@ -1205,7 +1203,7 @@ mod tests {
 
     fn opts() -> TranslateOptions {
         TranslateOptions {
-            session_id: None,
+            prompt_cache_key: None,
             service_tier: None,
             model: "gpt-5.5".to_string(),
             use_responses_lite: false,
@@ -1317,7 +1315,7 @@ mod tests {
         let out = translate_request(
             &req,
             TranslateOptions {
-                session_id: Some("s".into()),
+                prompt_cache_key: Some("s".into()),
                 service_tier: None,
                 model: "gpt-5.5".to_string(),
                 use_responses_lite: false,
@@ -1472,7 +1470,7 @@ mod tests {
         let out = translate_request(
             &req,
             TranslateOptions {
-                session_id: None,
+                prompt_cache_key: None,
                 service_tier: None,
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: true,
@@ -1505,7 +1503,7 @@ mod tests {
         let out = translate_request(
             &req,
             TranslateOptions {
-                session_id: None,
+                prompt_cache_key: None,
                 service_tier: None,
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: false,
