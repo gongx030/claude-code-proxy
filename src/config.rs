@@ -311,11 +311,11 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
         out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
     }
-    if env
+    let env_cache_key = env
         .get("CCP_CODEX_PROMPT_CACHE_KEY")
-        .is_some_and(|raw| !raw.is_empty())
-    {
-        out.push("CCP_CODEX_PROMPT_CACHE_KEY (env)".to_string());
+        .filter(|raw| !raw.trim().is_empty());
+    if let Some(raw) = env_cache_key {
+        out.push(format!("codex.promptCacheKey: {} (env)", raw.trim()));
     }
     if env
         .get("CCP_AUTO_REVIEW_MODEL")
@@ -365,8 +365,10 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
             }
-            if codex.prompt_cache_key.is_some() {
-                out.push("codex.promptCacheKey (config)".to_string());
+            if env_cache_key.is_none()
+                && let Some(raw) = codex.prompt_cache_key.filter(|raw| !raw.trim().is_empty())
+            {
+                out.push(format!("codex.promptCacheKey: {} (config)", raw.trim()));
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
@@ -762,17 +764,19 @@ pub fn parse_prompt_cache_key_mode(raw: &str) -> anyhow::Result<PromptCacheKeyMo
     }
 }
 
-/// Env var first, then `codex.promptCacheKey`; an invalid value is an error.
+/// Env var first, then `codex.promptCacheKey`; blank = unset in both, a
+/// non-blank invalid value is an error.
 /// `main` calls this at startup so a typo fails before the first request.
 pub fn codex_prompt_cache_key_mode() -> anyhow::Result<PromptCacheKeyMode> {
     if let Ok(raw) = std::env::var("CCP_CODEX_PROMPT_CACHE_KEY")
-        && !raw.is_empty()
+        && !raw.trim().is_empty()
     {
         return parse_prompt_cache_key_mode(&raw);
     }
     match read_file_config(&paths::config_dir())
         .and_then(|file| file.codex)
         .and_then(|codex| codex.prompt_cache_key)
+        .filter(|raw| !raw.trim().is_empty())
     {
         Some(raw) => parse_prompt_cache_key_mode(&raw),
         None => Ok(PromptCacheKeyMode::Session),

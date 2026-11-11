@@ -84,7 +84,7 @@ fn compact_request() -> MessagesRequest {
 
 fn translate_compact() -> Value {
     let opts = TranslateOptions {
-        session_id: None,
+        prompt_cache_key: None,
         service_tier: None,
         model: "gpt-5.5".to_string(),
         use_responses_lite: false,

@@ -7,8 +7,8 @@ description: Release notes for claude-code-proxy.
 
 - Codex: the new `CCP_CODEX_PROMPT_CACHE_KEY` / `codex.promptCacheKey` setting
   is an experiment knob for `prompt_cache_key`. `session` (default, unchanged)
-  sends the session id, `thread` gives each subagent a derived key, and `omit`
-  sends none. An invalid value stops startup.
+  sends the session id, `thread` gives each distinct subagent id a distinct derived key, and `omit`
+  sends none. An empty value is treated as unset; any other invalid value stops startup.
 
 ## v0.1.43 (2026-09-30)
 

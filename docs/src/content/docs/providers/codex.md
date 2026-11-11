@@ -117,10 +117,10 @@ While the native request is active, the monitor shows `compacting`. Structured l
 `CCP_CODEX_PROMPT_CACHE_KEY` (or `codex.promptCacheKey`) selects the `prompt_cache_key` sent on Codex Responses requests, over both WebSocket and HTTP:
 
 - `session` (default): the Claude Code session id, shared by the main thread and its subagents.
-- `thread`: the main thread keeps the session id. A subagent request gets a stable key derived with SHA-256 from the session id and agent id, so sibling subagents and other sessions do not share a key. Requests without valid session and agent headers use the session id.
+- `thread`: the main thread keeps the session id. A subagent request gets a stable key derived with SHA-256 from the session id and agent id, so distinct agent ids (and distinct sessions) get distinct keys. Requests without valid session and agent headers use the session id.
 - `omit`: no `prompt_cache_key` is sent.
 
-This is an experiment knob. The effect of `thread` or `omit` on cache hits has not been measured, and `session` stays the default. Other values stop `serve` at startup. The `session-id` and `x-client-request-id` headers are unchanged in every mode. The `codex_upstream_request_started` log record reports `promptCacheKeyMode` and `identityKind` (`main`, `agent`, or `none`), never the ids or the key.
+This is an experiment knob. The effect of `thread` or `omit` on cache hits has not been measured, and `session` stays the default. An empty value is treated as unset; any other invalid value stops `serve` at startup. The `session-id` and `x-client-request-id` headers are unchanged in every mode. The `codex_upstream_request_started` log record reports `promptCacheKeyMode` and `identityKind` (`main`, `agent`, or `none`), never the ids or the key.
 
 ## OpenAI-compatible APIs
 
