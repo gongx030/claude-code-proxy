@@ -1,4 +1,5 @@
 pub mod auth;
+pub(crate) mod cache_key;
 pub mod chat_completions;
 pub mod client;
 pub mod compaction;
@@ -216,6 +217,22 @@ impl CodexProvider {
             }
         };
 
+        let cache_key_mode = match config::codex_prompt_cache_key_mode() {
+            Ok(mode) => mode,
+            Err(error) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    error.to_string(),
+                );
+            }
+        };
+        translated.prompt_cache_key = cache_key::resolve(
+            cache_key_mode,
+            ctx.session_id.as_deref(),
+            conversation_identity.as_ref(),
+        );
+
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
         let mut compaction_attempt = None;
@@ -322,6 +339,14 @@ impl CodexProvider {
                     serde_json::json!(continuation.candidate().input_delta.as_ref().map(Vec::len)),
                 ),
                 ("turnId".to_string(), serde_json::json!(turn_id)),
+                (
+                    "promptCacheKeyMode".to_string(),
+                    serde_json::json!(cache_key_mode.as_str()),
+                ),
+                (
+                    "identityKind".to_string(),
+                    serde_json::json!(cache_key::identity_kind(conversation_identity.as_ref())),
+                ),
             ])),
         );
 

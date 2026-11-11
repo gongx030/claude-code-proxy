@@ -112,6 +112,16 @@ Replay requires the same Claude Code session and Codex model with append-only hi
 
 While the native request is active, the monitor shows `compacting`. Structured log events named `server_compaction_triggered`, `server_compaction_completed`, and `server_compaction_failed` report each attempt and outcome.
 
+## Prompt cache key (experiment)
+
+`CCP_CODEX_PROMPT_CACHE_KEY` (or `codex.promptCacheKey`) selects the `prompt_cache_key` sent on Codex Responses requests, over both WebSocket and HTTP:
+
+- `session` (default): the Claude Code session id, shared by the main thread and its subagents.
+- `thread`: the main thread keeps the session id. A subagent request gets a stable key derived with SHA-256 from the session id and agent id, so sibling subagents and other sessions do not share a key. Requests without valid session and agent headers use the session id.
+- `omit`: no `prompt_cache_key` is sent.
+
+This is an experiment knob. The effect of `thread` or `omit` on cache hits has not been measured, and `session` stays the default. Other values stop `serve` at startup. The `session-id` and `x-client-request-id` headers are unchanged in every mode. The `codex_upstream_request_started` log record reports `promptCacheKeyMode` and `identityKind` (`main`, `agent`, or `none`), never the ids or the key.
+
 ## OpenAI-compatible APIs
 
 `CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`. The setting is under Codex configuration, but the routes also accept Kimi, Grok, OpenCode Go, and Cursor models.

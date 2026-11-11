@@ -76,6 +76,8 @@ struct CodexConfig {
     #[serde(rename = "model")]
     pub model: Option<String>,
     pub transport: Option<String>,
+    #[serde(rename = "promptCacheKey")]
+    pub prompt_cache_key: Option<String>,
     #[serde(rename = "headerTimeoutMs")]
     pub header_timeout_ms: Option<u64>,
 }
@@ -310,6 +312,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
     }
     if env
+        .get("CCP_CODEX_PROMPT_CACHE_KEY")
+        .is_some_and(|raw| !raw.is_empty())
+    {
+        out.push("CCP_CODEX_PROMPT_CACHE_KEY (env)".to_string());
+    }
+    if env
         .get("CCP_AUTO_REVIEW_MODEL")
         .is_some_and(|raw| !raw.is_empty())
     {
@@ -356,6 +364,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
+            }
+            if codex.prompt_cache_key.is_some() {
+                out.push("codex.promptCacheKey (config)".to_string());
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
@@ -717,6 +728,57 @@ pub fn codex_server_compaction() -> bool {
     false
 }
 
+/// How the Codex provider fills `prompt_cache_key` on Responses requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PromptCacheKeyMode {
+    /// The Claude Code session id (historical behavior).
+    #[default]
+    Session,
+    /// Main thread keeps the session id; each subagent gets a derived key.
+    Thread,
+    /// No `prompt_cache_key` is sent.
+    Omit,
+}
+
+impl PromptCacheKeyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Thread => "thread",
+            Self::Omit => "omit",
+        }
+    }
+}
+
+pub fn parse_prompt_cache_key_mode(raw: &str) -> anyhow::Result<PromptCacheKeyMode> {
+    match raw.trim() {
+        "session" => Ok(PromptCacheKeyMode::Session),
+        "thread" => Ok(PromptCacheKeyMode::Thread),
+        "omit" => Ok(PromptCacheKeyMode::Omit),
+        other => Err(anyhow::anyhow!(
+            "invalid Codex prompt cache key mode {other:?}; expected session, thread, or omit \
+             (CCP_CODEX_PROMPT_CACHE_KEY or codex.promptCacheKey)"
+        )),
+    }
+}
+
+/// Env var first, then `codex.promptCacheKey`; an invalid value is an error.
+/// `main` calls this at startup so a typo fails before the first request.
+pub fn codex_prompt_cache_key_mode() -> anyhow::Result<PromptCacheKeyMode> {
+    if let Ok(raw) = std::env::var("CCP_CODEX_PROMPT_CACHE_KEY")
+        && !raw.is_empty()
+    {
+        return parse_prompt_cache_key_mode(&raw);
+    }
+    match read_file_config(&paths::config_dir())
+        .and_then(|file| file.codex)
+        .and_then(|codex| codex.prompt_cache_key)
+    {
+        Some(raw) => parse_prompt_cache_key_mode(&raw),
+        None => Ok(PromptCacheKeyMode::Session),
+    }
+}
+
 pub fn codex_responses_api() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
@@ -1023,6 +1085,7 @@ mod tests {
             EnvGuard::unset("CCP_LOG_STDERR"),
             EnvGuard::unset("CCP_CODEX_REASONING_SUMMARY"),
             EnvGuard::unset("CCP_CODEX_SERVER_COMPACTION"),
+            EnvGuard::unset("CCP_CODEX_PROMPT_CACHE_KEY"),
             EnvGuard::unset("CCP_CODEX_RESPONSES_API"),
             EnvGuard::unset("CCP_CODEX_IMAGES_API"),
             EnvGuard::unset("CCP_CODEX_IMAGES_BASE_URL"),
