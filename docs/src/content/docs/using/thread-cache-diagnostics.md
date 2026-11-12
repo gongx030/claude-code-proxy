@@ -7,24 +7,24 @@ Codex thread diagnostics observe requests to `/v1/messages` without changing ups
 
 ## Enable for an isolated run
 
-Set these environment variables before constructing the provider:
+Set these environment variables before sending requests:
 
 ```sh
 export CCP_CODEX_THREAD_DIAGNOSTICS=1
 export CCP_CODEX_THREAD_DIAGNOSTICS_DIR=/tmp/new-private-codex-diagnostics
 ```
 
-`1`, `true`, and `on` enable diagnostics (case-sensitive, surrounding whitespace ignored). All other values disable them. The directory must be **new**, with an existing parent; do not create it beforehand. Existing directories, files, and symlinks are refused, not reused or truncated. Choose a fresh directory for each run. Configuration is read when the provider is constructed, not for each request. Do not restart or replace a proxy serving other sessions merely to collect observations.
+`1`, `true`, and `on` enable diagnostics (case-sensitive, surrounding whitespace ignored). All other values disable them. The directory must be **new**, with existing ancestors; do not create it beforehand. No path component may be a symlink, and `..` components are refused. Existing directories, files, and symlinks are refused, not reused or truncated. Choose a fresh directory for each run. Configuration is read at request entry; the sink is initialized lazily on its dedicated writer thread and shared across provider registries for the current configured path. Filesystem initialization never runs under the shared observer lock or on the asynchronous request worker. Banner and monitor setup do not claim the sink. Initialization or writer failure is retained for the current path: later requests do not retry it. Changing the path replaces the one cached observer, not an unbounded registry of sinks. Do not change configuration or restart or replace a proxy serving other sessions merely to collect observations.
 
 The secure sink is available on Unix only. A missing path, creation error, or unavailable secure sink disables output without failing inference. A later write error stops output. Missing output is not evidence of zero misses. This sink is separate from general logs and traffic capture; enabling it does not enable either, and its privacy restrictions do not sanitize independently enabled traffic logs.
 
 ## Output and retention
 
-The new directory is created with mode `0700`; files use `0600` (a restrictive umask may reduce permissions further). Newline-delimited JSON is written to `turns.jsonl`, with at most one `turns.previous.jsonl` backup. Each file is bounded to 1 MiB. Rotation discards the oldest backup. No prompts, credentials, headers, cache keys, paths, session/agent identifiers, hashes, or thread ordinals are emitted.
+The new directory is created with mode `0700`; files use `0600` (a restrictive umask may reduce permissions further). Newline-delimited JSON is written to `turns.jsonl`, with at most one `turns.previous.jsonl` backup. Each file is bounded to 1 MiB. Rotation discards the oldest backup. Creation walks directory components without following symlinks; subsequent file checks and rotation operate relative to the retained private directory handle. Renaming or substituting an ancestor cannot redirect writes or rotation to another directory. A renamed sink may continue writing to its original directory. This protects against other users modifying writable ancestors, not a hostile process with the same user privileges. No prompts, credentials, headers, cache keys, paths, session/agent identifiers, hashes, or thread ordinals are emitted.
 
 A bounded queue holds at most 128 records. A full queue drops observations rather than waiting for disk. Process termination can lose queued records. There is no durable completeness guarantee or drop counter. Treat missing, rotated, or interrupted samples as incomplete, not as negative observations. Protect and delete the output according to your own retention requirements; the proxy does not delete the directory on exit.
 
-In-memory tracking holds at most 1,024 thread entries with a 30-minute idle time-to-live, checked lazily at request entry. Least-recently-touched entries are evicted at capacity. Validated identities exist only in this bounded tracking map and guards for active requests; active guards scale with concurrent requests. Request entry scans at most 1,024 entries. Locks cover bookkeeping only, never asynchronous operations or sink output. These are implementation bounds, not measured latency or throughput claims.
+In-memory tracking holds at most 1,024 thread entries with a 30-minute idle time-to-live, checked lazily at request entry. Active entries are pinned: only inactive entries expire or are evicted by least-recent touch. If all entries are active, new identities are not retained. A bounded global count and ambiguity flag suppress known gaps and predecessor creation until all outstanding identified requests, including refused admissions, finish. This conservatively prevents an untracked active request from becoming a false predecessor gap. Validated identities exist only in this bounded tracking map and guards for admitted active requests; active guards scale with concurrent requests. Request entry scans at most 1,024 entries. Locks cover bookkeeping only, never asynchronous operations or sink output. These are implementation bounds, not measured latency or throughput claims.
 
 ## Schema 1
 

@@ -115,6 +115,8 @@ struct Entry {
 struct State {
     entries: HashMap<ConversationIdentity, Entry>,
     sequence: u64,
+    active: usize,
+    admission_ambiguous: bool,
 }
 struct Reservation {
     owner: ConversationIdentity,
@@ -122,6 +124,7 @@ struct Reservation {
     generation: u64,
 }
 struct Pending {
+    counted: bool,
     reservation: Option<Reservation>,
     started: Instant,
     record: Record,
@@ -130,19 +133,31 @@ struct Pending {
 impl State {
     fn begin(&mut self, owner: Option<&ConversationIdentity>, now: Instant) -> Pending {
         self.entries.retain(|_, entry| {
-            now.checked_duration_since(entry.touched)
-                .is_some_and(|age| age < TTL)
+            entry.active > 0
+                || now
+                    .checked_duration_since(entry.touched)
+                    .is_some_and(|age| age < TTL)
         });
         let mut gap = Bucket::Unknown;
-        let reservation = owner.map(|owner| {
+        let reservation = owner.and_then(|owner| {
+            self.active = self.active.saturating_add(1);
             if !self.entries.contains_key(owner) && self.entries.len() >= CAPACITY {
                 let oldest = self
                     .entries
                     .iter()
+                    .filter(|(_, entry)| entry.active == 0)
                     .min_by_key(|(_, entry)| entry.touched)
                     .map(|(key, _)| key.clone());
                 if let Some(oldest) = oldest {
                     self.entries.remove(&oldest);
+                } else {
+                    // Refused identities may overlap later admissions: no known gaps
+                    // until all outstanding reservations (including refusals) drain.
+                    self.admission_ambiguous = true;
+                    for entry in self.entries.values_mut() {
+                        entry.completed = None;
+                    }
+                    return None;
                 }
             }
             self.sequence = self.sequence.wrapping_add(1);
@@ -168,13 +183,17 @@ impl State {
             entry.active = entry.active.saturating_add(1);
             entry.generation = sequence;
             entry.touched = now;
-            Reservation {
+            Some(Reservation {
                 owner: owner.clone(),
                 epoch: entry.epoch,
                 generation: sequence,
-            }
+            })
         });
+        if self.admission_ambiguous {
+            gap = Bucket::Unknown;
+        }
         Pending {
+            counted: owner.is_some(),
             reservation,
             started: now,
             record: Record {
@@ -210,8 +229,9 @@ impl State {
         if let Some(reservation) = pending.reservation {
             match self.entries.get_mut(&reservation.owner) {
                 Some(entry) if entry.epoch == reservation.epoch => {
-                    let unambiguous =
-                        !entry.ambiguous && entry.generation == reservation.generation;
+                    let unambiguous = !self.admission_ambiguous
+                        && !entry.ambiguous
+                        && entry.generation == reservation.generation;
                     if !unambiguous {
                         pending.record.gap = Bucket::Unknown;
                     }
@@ -225,6 +245,12 @@ impl State {
                     }
                 }
                 _ => pending.record.gap = Bucket::Unknown,
+            }
+        }
+        if pending.counted {
+            self.active = self.active.saturating_sub(1);
+            if self.active == 0 {
+                self.admission_ambiguous = false;
             }
         }
         if outcome == Outcome::Success {
@@ -254,30 +280,66 @@ impl State {
     }
 }
 
+pub(super) fn enabled() -> bool {
+    matches!(
+        std::env::var("CCP_CODEX_THREAD_DIAGNOSTICS")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1" | "true" | "on")
+    )
+}
+
 pub(super) struct Observer {
     state: Mutex<State>,
     sender: mpsc::SyncSender<Record>,
 }
+struct SharedObserver {
+    directory: Option<std::path::PathBuf>,
+    observer: Option<Arc<Observer>>,
+}
+impl SharedObserver {
+    fn get(&mut self, directory: std::path::PathBuf) -> Option<Arc<Observer>> {
+        if self.directory.as_ref() != Some(&directory) {
+            self.observer = Observer::configured(Some("true"), Some(&directory));
+            self.directory = Some(directory);
+        }
+        self.observer.clone()
+    }
+}
 impl Observer {
     pub fn from_env() -> Option<Arc<Self>> {
+        static OBSERVER: Mutex<SharedObserver> = Mutex::new(SharedObserver {
+            directory: None,
+            observer: None,
+        });
         let enabled = std::env::var("CCP_CODEX_THREAD_DIAGNOSTICS").ok();
-        Self::configured(
-            enabled.as_deref(),
-            std::env::var_os("CCP_CODEX_THREAD_DIAGNOSTICS_DIR")
-                .as_deref()
-                .map(Path::new),
-        )
+        if !matches!(enabled.as_deref().map(str::trim), Some("1" | "true" | "on")) {
+            return None;
+        }
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("CCP_CODEX_THREAD_DIAGNOSTICS_DIR")?);
+        OBSERVER.lock().ok()?.get(directory)
     }
 
     fn configured(enabled: Option<&str>, directory: Option<&Path>) -> Option<Arc<Self>> {
         if !matches!(enabled.map(str::trim), Some("1" | "true" | "on")) {
             return None;
         }
-        let mut sink = Sink::create(directory?).ok()?;
+        let directory = directory?.to_owned();
+        Self::start_writer(move || Sink::create(&directory))
+    }
+
+    fn start_writer(
+        create: impl FnOnce() -> std::io::Result<Sink> + Send + 'static,
+    ) -> Option<Arc<Self>> {
         let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("codex-diagnostics".into())
             .spawn(move || {
+                let Ok(mut sink) = create() else {
+                    return;
+                };
                 while let Ok(record) = receiver.recv() {
                     if sink.write(&record).is_err() {
                         break;
@@ -316,6 +378,61 @@ impl Observer {
     }
 }
 
+#[derive(Default)]
+pub(super) struct Receipt {
+    translator: Option<super::translate::live_stream::LiveStreamTranslator>,
+    completed: Option<(Instant, Outcome, Option<u64>, Option<u64>)>,
+    turn: Option<std::sync::Weak<TurnInner>>,
+}
+impl Receipt {
+    pub fn observe(&mut self, payload: &Value) {
+        // Reuse acceptance semantics, including signature-only reasoning, without traffic capture.
+        let translator = self.translator.get_or_insert_with(|| {
+            super::translate::live_stream::LiveStreamTranslator::new("diagnostic", "diagnostic")
+        });
+        let _ = translator.accept(payload, None);
+        let semantic = translator.has_semantic_output();
+        if !semantic && super::events::event_is_terminal(payload) {
+            self.translator = None;
+        }
+        if semantic && super::events::event_is_terminal(payload) {
+            let outcome = if super::events::event_is_success_terminal(payload) {
+                Outcome::Success
+            } else {
+                Outcome::Failure
+            };
+            self.completed = Some((
+                Instant::now(),
+                outcome,
+                payload
+                    .pointer("/response/usage/input_tokens")
+                    .and_then(Value::as_u64),
+                payload
+                    .pointer("/response/usage/input_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64),
+            ));
+            self.deliver();
+        }
+    }
+    pub fn attach(&mut self, turn: &Turn) {
+        self.turn = Some(Arc::downgrade(&turn.0));
+        self.deliver();
+    }
+    fn deliver(&self) {
+        if let Some((now, outcome, input, cached)) = self.completed
+            && let Some(turn) = self.turn.as_ref().and_then(std::sync::Weak::upgrade)
+        {
+            Turn(turn).finish(
+                now,
+                outcome,
+                Some(&serde_json::json!({
+                    "input_tokens": input, "input_tokens_details": {"cached_tokens": cached}
+                })),
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Turn(Arc<TurnInner>);
 struct TurnInner {
@@ -340,6 +457,26 @@ impl Turn {
             };
             pending.record.lane = if lite { Lane::Lite } else { Lane::Full };
         }
+    }
+    pub fn error(&self, error: &super::client::CodexError) {
+        let missing_terminal = error.status == 0
+            && matches!(
+                (error.origin, error.detail.as_deref()),
+                (
+                    super::client::CodexErrorOrigin::Http
+                        | super::client::CodexErrorOrigin::BufferedHttp,
+                    Some("http_response_sse" | "http_response_body")
+                ) | (
+                    super::client::CodexErrorOrigin::WebSocket
+                        | super::client::CodexErrorOrigin::BufferedWebSocket,
+                    Some(super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL)
+                )
+            );
+        self.end(if missing_terminal {
+            Outcome::MissingTerminal
+        } else {
+            Outcome::Failure
+        });
     }
     pub fn end(&self, outcome: Outcome) {
         self.finish(Instant::now(), outcome, None);
@@ -366,6 +503,17 @@ impl Turn {
             self.end(Outcome::Failure);
         }
     }
+    pub fn buffered_error(&self, body: &[u8]) {
+        let missing_terminal = super::translate::reducer::reduce_upstream_bytes(body)
+            .err()
+            .and_then(|error| error.diagnostics)
+            .is_some_and(|diagnostics| !diagnostics.saw_terminal_event);
+        self.end(if missing_terminal {
+            Outcome::MissingTerminal
+        } else {
+            Outcome::Failure
+        });
+    }
     pub fn buffered(&self, body: &[u8]) {
         for event in crate::anthropic::sse::parse_sse_events(body) {
             if let Ok(payload) = serde_json::from_str::<Value>(&event.data)
@@ -391,53 +539,75 @@ impl Drop for TurnInner {
 
 #[cfg(unix)]
 struct Sink {
-    directory: std::path::PathBuf,
-    directory_metadata: std::fs::Metadata,
+    directory: std::fs::File,
     file: std::fs::File,
     bytes: u64,
-    backup: Option<std::fs::Metadata>,
+    backup: Option<rustix::fs::Stat>,
 }
 #[cfg(unix)]
 impl Sink {
     fn create(directory: &Path) -> std::io::Result<Self> {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        // A fresh private directory refuses existing files, directories and symlinks.
-        std::fs::DirBuilder::new().mode(0o700).create(directory)?;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(directory.join("turns.jsonl"))?;
+        use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+        use std::path::Component;
+        let absolute = std::path::absolute(directory)?;
+        if absolute.file_name().is_none() {
+            return Err(std::io::Error::other("diagnostic directory must be new"));
+        }
+        let mut components = absolute.components().peekable();
+        let mut parent = open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        while let Some(component) = components.next() {
+            match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => {
+                    if components.peek().is_none() {
+                        mkdirat(&parent, name, Mode::from_raw_mode(0o700))?;
+                    }
+                    parent = openat(
+                        &parent,
+                        name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )?;
+                }
+                _ => return Err(std::io::Error::other("invalid diagnostic directory")),
+            }
+        }
+        let directory = std::fs::File::from(parent);
+        use std::os::unix::fs::MetadataExt;
+        if directory.metadata()?.mode() & 0o077 != 0 {
+            return Err(std::io::Error::other("diagnostic directory exposed"));
+        }
+        let file = std::fs::File::from(openat(
+            &directory,
+            "turns.jsonl",
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )?);
         Ok(Self {
-            directory: directory.to_owned(),
-            directory_metadata: std::fs::symlink_metadata(directory)?,
+            directory,
             file,
             bytes: 0,
             backup: None,
         })
     }
     fn write(&mut self, record: &Record) -> std::io::Result<()> {
+        use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, statat, unlinkat};
         use std::io::Write;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let directory = std::fs::symlink_metadata(&self.directory)?;
-        if !directory.is_dir()
-            || directory.dev() != self.directory_metadata.dev()
-            || directory.ino() != self.directory_metadata.ino()
-            || directory.mode() & 0o077 != 0
-        {
-            return Err(std::io::Error::other(
-                "diagnostic directory replaced or exposed",
-            ));
+        use std::os::unix::fs::MetadataExt;
+        if self.directory.metadata()?.mode() & 0o077 != 0 {
+            return Err(std::io::Error::other("diagnostic directory exposed"));
         }
-        let active = self.directory.join("turns.jsonl");
-        let actual = std::fs::symlink_metadata(&active)?;
-        let expected = self.file.metadata()?;
-        if !actual.is_file()
-            || actual.dev() != expected.dev()
-            || actual.ino() != expected.ino()
-            || actual.nlink() != 1
-            || expected.len() != self.bytes
-            || actual.mode() & 0o077 != 0
+        let actual = statat(&self.directory, "turns.jsonl", AtFlags::SYMLINK_NOFOLLOW)?;
+        let expected = rustix::fs::fstat(&self.file)?;
+        if actual.st_dev != expected.st_dev
+            || actual.st_ino != expected.st_ino
+            || actual.st_nlink != 1
+            || self.file.metadata()?.len() != self.bytes
+            || actual.st_mode & 0o077 != 0
         {
             return Err(std::io::Error::other("diagnostic output replaced"));
         }
@@ -447,27 +617,34 @@ impl Sink {
             return Err(std::io::Error::other("diagnostic record too large"));
         }
         if self.bytes + line.len() as u64 > MAX_BYTES {
-            let backup = self.directory.join("turns.previous.jsonl");
+            let backup = "turns.previous.jsonl";
             if let Some(expected) = &self.backup {
-                let actual = std::fs::symlink_metadata(&backup)?;
-                if !actual.is_file()
-                    || actual.dev() != expected.dev()
-                    || actual.ino() != expected.ino()
-                    || actual.nlink() != 1
+                let actual = statat(&self.directory, backup, AtFlags::SYMLINK_NOFOLLOW)?;
+                if actual.st_dev != expected.st_dev
+                    || actual.st_ino != expected.st_ino
+                    || actual.st_nlink != 1
                 {
                     return Err(std::io::Error::other("diagnostic backup replaced"));
                 }
-                std::fs::remove_file(&backup)?;
+                unlinkat(&self.directory, backup, AtFlags::empty())?;
             }
-            // hard_link refuses an unexpected backup rather than overwriting it.
-            std::fs::hard_link(&active, &backup)?;
-            self.backup = Some(self.file.metadata()?);
-            std::fs::remove_file(&active)?;
-            self.file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&active)?;
+            // All mutations are relative to the private directory handle, never
+            // a pathname that a writable ancestor can redirect during rotation.
+            linkat(
+                &self.directory,
+                "turns.jsonl",
+                &self.directory,
+                backup,
+                AtFlags::empty(),
+            )?;
+            self.backup = Some(rustix::fs::fstat(&self.file)?);
+            unlinkat(&self.directory, "turns.jsonl", AtFlags::empty())?;
+            self.file = std::fs::File::from(openat(
+                &self.directory,
+                "turns.jsonl",
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            )?);
             self.bytes = 0;
         }
         self.file.write_all(&line)?;
@@ -577,14 +754,49 @@ mod tests {
         }
         assert_eq!(state.entries.len(), CAPACITY);
         let replacement = state.begin(Some(&id), at(base, 2900));
+        assert_eq!(
+            state
+                .finish(replacement, at(base, 2900), Outcome::Success, None)
+                .gap,
+            Bucket::Unknown
+        );
+        let following = state.begin(Some(&id), at(base, 2901));
+        assert_eq!(following.record.gap, Bucket::Unknown);
         state.finish(expired, at(base, 2901), Outcome::Success, None);
         assert_eq!(
             state
-                .finish(replacement, at(base, 2902), Outcome::Success, None)
+                .finish(following, at(base, 2902), Outcome::Success, None)
                 .gap,
             Bucket::Unknown
         );
         assert_eq!(state.entries.len(), CAPACITY);
+
+        let mut state = State::default();
+        let mut active = Vec::new();
+        for index in 0..CAPACITY {
+            active.push(state.begin(Some(&owner(&format!("pinned-{index}"))), base));
+        }
+        let refused_id = owner("refused");
+        let refused = state.begin(Some(&refused_id), at(base, 1801));
+        assert!(refused.reservation.is_none());
+        state.finish(
+            active.pop().unwrap(),
+            at(base, 1802),
+            Outcome::Success,
+            None,
+        );
+        let admitted = state.begin(Some(&refused_id), at(base, 1803));
+        state.finish(admitted, at(base, 1804), Outcome::Success, None);
+        let following = state.begin(Some(&refused_id), at(base, 1805));
+        assert_eq!(following.record.gap, Bucket::Unknown);
+        state.finish(following, at(base, 1806), Outcome::Success, None);
+        state.finish(refused, at(base, 1807), Outcome::Success, None);
+        for pending in active {
+            state.finish(pending, at(base, 1808), Outcome::Success, None);
+        }
+        assert_eq!(state.active, 0);
+        assert!(!state.admission_ambiguous);
+        assert!(state.entries.len() <= CAPACITY);
 
         let (observer, receiver) = observer();
         let barrier = Arc::new(std::sync::Barrier::new(3));
@@ -680,6 +892,99 @@ mod tests {
             drop(next);
             receiver.recv().unwrap();
         }
+        for (detail, origin, expected) in [
+            (
+                "http_response_sse",
+                super::super::client::CodexErrorOrigin::Http,
+                Outcome::MissingTerminal,
+            ),
+            (
+                super::super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL,
+                super::super::client::CodexErrorOrigin::WebSocket,
+                Outcome::MissingTerminal,
+            ),
+            (
+                "http_response_body",
+                super::super::client::CodexErrorOrigin::Http,
+                Outcome::MissingTerminal,
+            ),
+            (
+                "http_response_headers",
+                super::super::client::CodexErrorOrigin::Http,
+                Outcome::Failure,
+            ),
+        ] {
+            let turn = observer.begin(Some(&id), Instant::now());
+            turn.error(&super::super::client::CodexError {
+                status: 0,
+                message: "raw-error-canary".into(),
+                detail: Some(detail.into()),
+                retry_after: None,
+                usage_limit: None,
+                origin,
+            });
+            let record = receiver.recv().unwrap();
+            assert_eq!(record.outcome, expected);
+            assert!(
+                !serde_json::to_string(&record)
+                    .unwrap()
+                    .contains("raw-error-canary")
+            );
+        }
+        for (terminal, outcome) in [
+            (
+                json!({"type":"response.completed","response":{"usage":usage(50)}}),
+                Outcome::Success,
+            ),
+            (
+                json!({"type":"response.failed","response":{"error":{"message":"synthetic failure"}}}),
+                Outcome::Failure,
+            ),
+        ] {
+            for events in [
+                vec![json!({"type":"response.output_text.delta","delta":"synthetic"})],
+                vec![
+                    json!({"type":"response.output_item.added", "output_index":0,
+                        "item":{"type":"reasoning","id":"synthetic","encrypted_content":"opaque"}}),
+                    json!({"type":"response.output_item.done", "output_index":0,
+                        "item":{"type":"reasoning","id":"synthetic"}}),
+                ],
+            ] {
+                for late_attach in [false, true] {
+                    let turn = observer.begin(Some(&id), Instant::now());
+                    let mut receipt = Receipt::default();
+                    if !late_attach {
+                        receipt.attach(&turn);
+                    }
+                    receipt.observe(&terminal);
+                    assert!(
+                        receiver.try_recv().is_err(),
+                        "pre-semantic terminals remain retryable"
+                    );
+                    for event in &events {
+                        receipt.observe(event);
+                    }
+                    receipt.observe(&terminal);
+                    if late_attach {
+                        receipt.attach(&turn);
+                    }
+                    drop(turn);
+                    assert_eq!(receiver.recv().unwrap().outcome, outcome);
+                    assert!(
+                        receiver.try_recv().is_err(),
+                        "delivery failure must not overwrite an accepted terminal"
+                    );
+                }
+            }
+        }
+        for (body, outcome) in [
+            (b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial\"}\n\n".as_slice(), Outcome::MissingTerminal),
+            (b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"failed\"}}}\n\n".as_slice(), Outcome::Failure),
+        ] {
+            let turn = observer.begin(Some(&id), Instant::now());
+            turn.buffered_error(body);
+            assert_eq!(receiver.recv().unwrap().outcome, outcome);
+        }
         let mut state = State::default();
         let base = Instant::now();
         let pending = state.begin(Some(&id), at(base, 10));
@@ -700,6 +1005,28 @@ mod tests {
             assert!(!path.exists());
         }
         assert!(Observer::configured(Some("true"), None).is_none());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (failed_tx, failed_rx) = mpsc::channel();
+        let background = Observer::start_writer(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            failed_tx.send(()).unwrap();
+            Err(std::io::Error::other("synthetic initialization failure"))
+        })
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Bookkeeping and enqueueing must proceed while filesystem initialization is blocked.
+        background.begin(None, Instant::now()).end(Outcome::Failure);
+        release_tx.send(()).unwrap();
+        failed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut shared = SharedObserver {
+            directory: None,
+            observer: None,
+        };
+        let invalid = root.path().join("missing-parent").join("diagnostics");
+        let first = shared.get(invalid.clone()).unwrap();
+        assert!(Arc::ptr_eq(&first, &shared.get(invalid).unwrap()));
         let mut sink = Sink::create(&path).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -725,6 +1052,27 @@ mod tests {
         for file in files {
             assert!(file.metadata().unwrap().len() <= MAX_BYTES);
         }
+        let held = root.path().join("held");
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        for name in ["turns.jsonl", "turns.previous.jsonl"] {
+            std::fs::write(victim.join(name), "must survive rotation").unwrap();
+        }
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::rename(&path, &held).unwrap();
+        symlink(&victim, &path).unwrap();
+        assert!(Sink::create(&path.join("nested")).is_err());
+        for _ in 0..10000 {
+            sink.write(&record).unwrap();
+        }
+        for name in ["turns.jsonl", "turns.previous.jsonl"] {
+            assert_eq!(
+                std::fs::read_to_string(victim.join(name)).unwrap(),
+                "must survive rotation"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&held, &path).unwrap();
         let active = path.join("turns.jsonl");
         let existing = root.path().join("existing");
         std::fs::write(&existing, "must survive").unwrap();
