@@ -80,7 +80,8 @@ impl CodexWebSocketEventStream {
     pub(crate) fn pending(
         receiver: CodexWebSocketEventReceiver,
     ) -> (Self, CodexWebSocketSocketIdPublisher) {
-        let receipt = super::diagnostics::enabled().then(|| Arc::new(Mutex::new(super::diagnostics::Receipt::default())));
+        let receipt = super::diagnostics::enabled()
+            .then(|| Arc::new(Mutex::new(super::diagnostics::Receipt::default())));
         let socket_id = Arc::new(AtomicU64::new(0));
         let full_context_retry = Arc::new(AtomicBool::new(false));
         let provider_retry_handoff = Arc::new(AtomicBool::new(false));
@@ -103,7 +104,8 @@ impl CodexWebSocketEventStream {
 
     pub(super) fn observe_with(&self, turn: &super::diagnostics::Turn) {
         if let Some(receipt) = self.receipt.as_ref()
-            && let Ok(mut receipt) = receipt.lock() {
+            && let Ok(mut receipt) = receipt.lock()
+        {
             receipt.attach(turn);
         }
     }
@@ -142,7 +144,8 @@ impl CodexWebSocketEventStream {
 impl CodexWebSocketSocketIdPublisher {
     pub(super) fn observe(&self, payload: &serde_json::Value) {
         if let Some(receipt) = self.receipt.as_ref()
-            && let Ok(mut receipt) = receipt.lock() {
+            && let Ok(mut receipt) = receipt.lock()
+        {
             receipt.observe(payload);
         }
     }
@@ -1104,8 +1107,14 @@ pub(super) fn start_codex_websocket_events(
                 .await;
             return;
         }
-        let (reusable, terminal_item) =
-            stream_ws_events(&mut guard, idle_timeout_ms, traffic, &tx, &socket_id_publisher).await;
+        let (reusable, terminal_item) = stream_ws_events(
+            &mut guard,
+            idle_timeout_ms,
+            traffic,
+            &tx,
+            &socket_id_publisher,
+        )
+        .await;
         drop(guard);
 
         let origin_reinserted = if reusable {

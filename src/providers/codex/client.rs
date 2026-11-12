@@ -1145,7 +1145,8 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
-        self.stream_codex_http_events_observed(body, ctx, None).await
+        self.stream_codex_http_events_observed(body, ctx, None)
+            .await
     }
 
     async fn stream_codex_http_events_observed(
@@ -1222,7 +1223,9 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         turn: Option<super::diagnostics::Turn>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let receiver = self.stream_codex_http_events_observed(body, ctx, turn).await?;
+        let receiver = self
+            .stream_codex_http_events_observed(body, ctx, turn)
+            .await?;
         let (stream, _) = super::websocket::CodexWebSocketEventStream::pending(receiver);
         Ok(stream)
     }
@@ -1290,7 +1293,8 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        self.stream_codex_auto_events_for_owner_observed(body, ctx, continuation, None).await
+        self.stream_codex_auto_events_for_owner_observed(body, ctx, continuation, None)
+            .await
     }
 
     pub(super) async fn stream_codex_auto_events_for_owner_observed(
@@ -1305,7 +1309,8 @@ impl CodexHttpClient {
             .await?;
         match websocket.recv().await {
             Some(Err(err)) if should_fallback_to_http(&err) => {
-                self.stream_codex_http_events_for_owner_observed(body, ctx, turn).await
+                self.stream_codex_http_events_for_owner_observed(body, ctx, turn)
+                    .await
             }
             Some(item) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -2048,7 +2053,8 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        self.stream_codex_websocket_events_for_owner_observed(body, ctx, continuation, None).await
+        self.stream_codex_websocket_events_for_owner_observed(body, ctx, continuation, None)
+            .await
     }
 
     pub(super) async fn stream_codex_websocket_events_for_owner_observed(

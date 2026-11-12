@@ -1175,15 +1175,24 @@ async fn smoke_diagnostics_normal_startup_owns_sink_once() {
         };
         let _upstream = EnvGuard::set("CCP_CODEX_BASE_URL", upstream);
         let startup_registry = Registry::with_default_alias();
-        assert!(startup_registry.provider_for_model("gpt-5.5", None).is_some());
-        assert!(!directory.exists(), "banner/monitor registry must not own a sink");
+        assert!(
+            startup_registry
+                .provider_for_model("gpt-5.5", None)
+                .is_some()
+        );
+        assert!(
+            !directory.exists(),
+            "banner/monitor registry must not own a sink"
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(claude_code_proxy::server::serve_listener(
             listener,
             with_monitor.then(claude_code_proxy::monitor::MonitorHandle::default),
-            async { let _ = stopped.await; },
+            async {
+                let _ = stopped.await;
+            },
         ));
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client.post(format!("http://{address}/v1/messages"))
@@ -2828,9 +2837,12 @@ async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
     let response = call_messages_body(json!({
         "model":"gpt-5.5", "max_tokens":64, "stream":true,
         "messages":[{"role":"user","content":"synthetic truncation"}]
-    })).await;
+    }))
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("event: error"));
     #[cfg(unix)]
     {

@@ -820,7 +820,12 @@ async fn live_stream_response(
             }
             config::CodexTransport::Auto => {
                 client
-                    .stream_codex_auto_events_for_owner_observed(&request_body, &ctx, continuation.as_ref(), turn.clone())
+                    .stream_codex_auto_events_for_owner_observed(
+                        &request_body,
+                        &ctx,
+                        continuation.as_ref(),
+                        turn.clone(),
+                    )
                     .await
             }
         };
@@ -955,7 +960,10 @@ async fn live_stream_response_once(
                     &request_continuation,
                     compaction.attempt,
                 );
-                return LiveStreamStart::Response(observed_codex_error_to_response(&err, turn.as_ref()));
+                return LiveStreamStart::Response(observed_codex_error_to_response(
+                    &err,
+                    turn.as_ref(),
+                ));
             }
         };
         if !generation_started && codex_generation_event(&payload) {
@@ -1561,7 +1569,10 @@ fn usage_limit_response(limit: &events::CodexUsageLimit) -> Response {
         .into_response()
 }
 
-fn observed_codex_error_to_response(err: &client::CodexError, turn: Option<&diagnostics::Turn>) -> Response {
+fn observed_codex_error_to_response(
+    err: &client::CodexError,
+    turn: Option<&diagnostics::Turn>,
+) -> Response {
     if let Some(turn) = turn {
         turn.error(err);
     }
