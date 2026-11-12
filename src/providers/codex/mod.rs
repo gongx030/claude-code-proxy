@@ -679,7 +679,9 @@ impl Provider for CodexProvider {
 /// Picks the upstream model and lane for a request. Hosted web_search must
 /// run on the full Responses API (the lite lane rejects hosted tools), and
 /// lite-only models like gpt-5.6-luna don't exist there, so such requests
-/// are upgraded to a full-lane model. Returns whether to use the lite lane.
+/// are upgraded to a full-lane model. Otherwise `full_lane` (the opt-in
+/// setting) moves Sol/Terra/Astra off lite; Luna stays on lite. Returns
+/// whether to use the lite lane.
 fn apply_model_lane_for_request(
     model: &mut String,
     body: &MessagesRequest,

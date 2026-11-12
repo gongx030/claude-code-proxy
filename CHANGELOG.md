@@ -5,6 +5,12 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Codex users can select `gpt-6.1-terra` and its `gpt-6.1-terra-fast`
+  priority-tier variant.
+- Codex: the opt-in `CCP_CODEX_FULL_LANE` / `codex.fullLane` setting moves
+  Sol, Terra and Astra models from Responses Lite to the full Responses lane,
+  which allows parallel tool calls. Luna stays on Lite, and
+  `CCP_CODEX_FULL_LANE=0` disables the setting over the config file.
 - Codex: the new `CCP_CODEX_PROMPT_CACHE_KEY` / `codex.promptCacheKey` setting
   is an experiment knob for `prompt_cache_key`. `session` (default, unchanged)
   sends the session id, `thread` gives each distinct subagent id a distinct derived key, and `omit`
