@@ -28,6 +28,10 @@ CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
 
 The proxy always makes streaming upstream requests. It can still accumulate a non-streaming Anthropic response when the client requests one.
 
+## MCP tool search
+
+Claude Code turns tool search off when `ANTHROPIC_BASE_URL` is not an Anthropic host, so every MCP tool schema is sent with every request. Setting `ENABLE_TOOL_SEARCH=true` is an opt-in that keeps tool search on behind the proxy: Claude Code then lists deferred tools by name and loads a tool's schema only after the model calls `ToolSearch` for it. The proxy does not set this variable. On Codex, the proxy appends each loaded tool where it was loaded, so earlier input is not rewritten by a load (see [Codex tools](/providers/codex/#tools-and-multimodal-input)).
+
 ## Compaction settings
 
 A trailing `[1m]` tells Claude Code to use its larger local context policy. The proxy strips the suffix before upstream routing. It does not enlarge the provider's context window.
