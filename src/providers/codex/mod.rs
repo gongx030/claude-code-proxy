@@ -5,6 +5,7 @@ pub mod client;
 pub mod compaction;
 pub mod continuation;
 pub mod count_tokens;
+mod diagnostics;
 pub(crate) mod events;
 pub mod images;
 pub mod native;
@@ -75,6 +76,7 @@ pub(crate) fn clear_session_compaction(session_id: &str) {
 
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
+    diagnostics: Option<Arc<diagnostics::Observer>>,
 }
 
 impl Default for CodexProvider {
@@ -87,6 +89,7 @@ impl CodexProvider {
     pub fn new() -> Self {
         Self {
             client: Arc::new(CodexHttpClient::new()),
+            diagnostics: diagnostics::Observer::from_env(),
         }
     }
 }
@@ -97,6 +100,28 @@ impl CodexProvider {
         body: MessagesRequest,
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
+    ) -> Response {
+        let turn = self
+            .diagnostics
+            .as_ref()
+            .map(|observer| observer.begin(conversation_identity.as_ref(), Instant::now()));
+        let response = self
+            .handle_messages_observed(body, ctx, conversation_identity, turn.clone())
+            .await;
+        if !response.status().is_success()
+            && let Some(turn) = turn.as_ref()
+        {
+            turn.end(diagnostics::Outcome::Failure);
+        }
+        response
+    }
+
+    async fn handle_messages_observed(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+        turn: Option<diagnostics::Turn>,
     ) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
@@ -115,6 +140,9 @@ impl CodexProvider {
             );
         }
         if search::is_standalone_search_request(&body) {
+            if let Some(turn) = turn.as_ref() {
+                turn.end(diagnostics::Outcome::Excluded);
+            }
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.model_resolved(&ctx.req_id, &resolved.model);
             }
@@ -209,6 +237,9 @@ impl CodexProvider {
                 );
             }
         };
+        if let Some(turn) = turn.as_ref() {
+            turn.configure(cache_key_mode, &resolved.model, use_responses_lite);
+        }
         let mut translated = match translate_request(
             &body,
             TranslateOptions {
@@ -368,6 +399,7 @@ impl CodexProvider {
                     attempt: compaction_attempt,
                 },
                 configured_transport,
+                turn.clone(),
             )
             .await;
             log.info(
@@ -491,6 +523,9 @@ impl CodexProvider {
                     output_tokens,
                 );
             }
+            if let Some(turn) = turn.as_ref() {
+                turn.buffered(&upstream.body);
+            }
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
                 &request_continuation,
@@ -515,6 +550,9 @@ impl CodexProvider {
                 ctx.traffic.as_deref(),
             ) {
                 Ok(json) => {
+                    if let Some(turn) = turn.as_ref() {
+                        turn.buffered(&upstream.body);
+                    }
                     if let Some(monitor) = ctx.monitor.as_ref() {
                         monitor.usage_updated(
                             &ctx.req_id,
@@ -748,6 +786,7 @@ async fn live_stream_response(
     continuation: ContinuationReservation,
     compaction: LiveStreamCompaction,
     transport: config::CodexTransport,
+    turn: Option<diagnostics::Turn>,
 ) -> Response {
     let model = model.to_string();
     let request_continuation = continuation.clone();
@@ -820,6 +859,7 @@ async fn live_stream_response(
             request_continuation.clone(),
             request_body.clone(),
             compaction,
+            turn.clone(),
         )
         .await
         {
@@ -885,6 +925,7 @@ async fn live_stream_response_once(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     compaction: LiveStreamCompaction,
+    turn: Option<diagnostics::Turn>,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -973,6 +1014,9 @@ async fn live_stream_response_once(
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
             record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
+                if let Some(turn) = turn.as_ref() {
+                    turn.terminal(&payload);
+                }
                 update_continuation_from_upstream(
                     ctx.session_id.as_deref(),
                     &request_continuation,
@@ -993,9 +1037,13 @@ async fn live_stream_response_once(
                 request_body,
                 upstream_sse_body,
                 compaction,
+                turn.clone(),
             ));
         }
         if terminal {
+            if let Some(turn) = turn.as_ref() {
+                turn.terminal(&payload);
+            }
             update_continuation_from_upstream(
                 ctx.session_id.as_deref(),
                 &request_continuation,
@@ -1106,6 +1154,7 @@ fn remaining_live_stream_response(
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
     compaction: LiveStreamCompaction,
+    turn: Option<diagnostics::Turn>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
@@ -1161,6 +1210,9 @@ fn remaining_live_stream_response(
                     ) {
                         Ok(result) => result,
                         Err(message) => {
+                            if let Some(turn) = turn.as_ref() {
+                                turn.end(diagnostics::Outcome::Failure);
+                            }
                             abort_request_state(
                                 ctx.session_id.as_deref(),
                                 &request_continuation,
@@ -1185,6 +1237,9 @@ fn remaining_live_stream_response(
                             return;
                         }
                     };
+                    if terminal && let Some(turn) = turn.as_ref() {
+                        turn.terminal(&payload);
+                    }
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
@@ -1210,6 +1265,9 @@ fn remaining_live_stream_response(
                     }
                 }
                 Err(err) => {
+                    if let Some(turn) = turn.as_ref() {
+                        turn.end(diagnostics::Outcome::Failure);
+                    }
                     abort_request_state(
                         ctx.session_id.as_deref(),
                         &request_continuation,
@@ -1239,6 +1297,9 @@ fn remaining_live_stream_response(
             }
         }
 
+        if let Some(turn) = turn.as_ref() {
+            turn.end(diagnostics::Outcome::MissingTerminal);
+        }
         abort_request_state(
             ctx.session_id.as_deref(),
             &request_continuation,
@@ -2022,6 +2083,7 @@ mod tests {
                 compact_boundary: false,
                 attempt: None,
             },
+            None,
         )
         .await
         {
@@ -2297,6 +2359,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                None,
             ),
         )
         .await
@@ -2412,6 +2475,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                None,
             )
             .await
         });
@@ -2497,6 +2561,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                None,
             ),
         )
         .await
@@ -2683,6 +2748,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                None,
             )
             .await
         });
