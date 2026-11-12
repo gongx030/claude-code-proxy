@@ -59,6 +59,7 @@ export default defineConfig({
             { label: 'Switching models and backends', slug: 'using/switching-models-and-backends' },
             { label: 'Monitor TUI', slug: 'using/monitor-tui' },
             { label: 'For coding agents', slug: 'using/for-coding-agents' },
+            { label: 'Thread cache diagnostics', slug: 'using/thread-cache-diagnostics' },
             { label: 'Troubleshooting', slug: 'using/troubleshooting' },
           ],
         },

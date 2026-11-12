@@ -1,0 +1,14 @@
+{
+  "canaries": ["synthetic-session-canary", "synthetic-agent-a-canary", "synthetic-agent-b-canary", "synthetic-parent-canary", "synthetic-prompt-canary", "synthetic-credential-canary"],
+  "turns": [
+    {"start":0,"end":1,"headers":{"x-claude-code-session-id":"synthetic-session-canary"},"gap":"unknown","cached":0},
+    {"start":2,"end":3,"headers":{"x-claude-code-session-id":"synthetic-session-canary","x-claude-code-agent-id":"synthetic-agent-a-canary"},"gap":"unknown","cached":100},
+    {"start":4,"end":5,"headers":{"x-claude-code-session-id":"synthetic-session-canary","x-claude-code-agent-id":"synthetic-agent-b-canary","x-claude-code-parent-agent-id":"synthetic-agent-a-canary"},"gap":"unknown","cached":0},
+    {"start":6,"end":7,"headers":{"x-claude-code-session-id":"synthetic-session-canary","x-claude-code-agent-id":"synthetic-agent-a-canary","x-claude-code-parent-agent-id":"synthetic-parent-canary"},"gap":"s1_to10","cached":50},
+    {"start":8,"end":9,"headers":{"x-claude-code-session-id":"synthetic-session-canary","x-claude-code-agent-id":"synthetic-agent-b-canary"},"gap":"s1_to10","cached":100},
+    {"start":11,"end":12,"headers":{"x-claude-code-session-id":"synthetic-session-canary"},"gap":"s10_to60","cached":0},
+    {"start":13,"end":14,"headers":{"x-claude-code-session-id":"synthetic-session-canary","x-claude-code-agent-id":"invalid agent"},"gap":"unknown","cached":0},
+    {"start":15,"end":16,"headers":{},"gap":"unknown","cached":0},
+    {"start":17,"end":18,"headers":{"x-claude-code-session-id":"synthetic-session-canary","x-claude-code-parent-agent-id":"synthetic-parent-canary"},"gap":"unknown","cached":0}
+  ]
+}

@@ -59,6 +59,14 @@ struct EnvGuard {
 }
 
 impl EnvGuard {
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
+
     fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
         unsafe {
@@ -119,6 +127,25 @@ async fn call_responses_body(body: Value) -> Response {
         )
         .await
         .unwrap()
+}
+
+#[cfg(unix)]
+async fn diagnostic_records(directory: &Path, count: usize) -> Vec<Value> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let text = std::fs::read_to_string(directory.join("turns.jsonl")).unwrap_or_default();
+            let records: Vec<Value> = text
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            if records.len() >= count {
+                return records;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("diagnostic sink must finish queued observations")
 }
 
 fn collect_files(root: &Path) -> Vec<PathBuf> {
@@ -1048,41 +1075,144 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
-
-    let captured = Arc::new(Mutex::new(None));
-    let upstream = spawn_http_upstream({
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock = axum::Router::new().fallback({
         let captured = captured.clone();
-        move |body: Value| {
-            let _ = captured.lock().map(|mut g| *g = Some(body));
-            concat!(
-                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"codex http ok\"}\n\n",
-                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
-            )
-            .as_bytes()
-            .to_vec()
+        move |headers: http::HeaderMap, body: bytes::Bytes| {
+            captured.lock().unwrap().push((headers, body));
+            async {
+                http::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(buffered_success_sse("codex http ok")))
+                    .unwrap()
+            }
         }
-    })
-    .await;
-
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, mock).await.unwrap();
+    });
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
-    let response = call_messages("gpt-5.5").await;
+    let _cache_env = EnvGuard::unset("CCP_CODEX_PROMPT_CACHE_KEY");
+    for stream in [false, true] {
+        let mut baseline = None;
+        for enabled in [None, Some("false"), Some("true")] {
+            clear_all_continuations_for_tests();
+            let _enabled = match enabled {
+                Some(value) => EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS", value),
+                None => EnvGuard::unset("CCP_CODEX_THREAD_DIAGNOSTICS"),
+            };
+            let directory = config
+                .path()
+                .join(format!("diagnostics-{stream}-{enabled:?}"));
+            let _directory = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS_DIR", &directory);
+            let response = call_messages_body(json!({
+                "model":"gpt-5.5", "max_tokens":64, "stream":stream,
+                "messages":[{"role":"user","content":"synthetic-prompt-canary"}]
+            }))
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if stream {
+                assert!(String::from_utf8_lossy(&bytes).contains("codex http ok"));
+            } else {
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["content"][0]["text"], "codex http ok");
+            }
+            let sent = captured.lock().unwrap().pop().unwrap();
+            let value: Value = serde_json::from_slice(&sent.1).unwrap();
+            assert_eq!(value["model"], "gpt-5.5");
+            assert_eq!(value["stream"], true);
+            assert_eq!(value["prompt_cache_key"], "smoke-session");
+            if let Some(baseline) = &baseline {
+                assert_eq!(&sent, baseline);
+            } else {
+                baseline = Some(sent);
+            }
+            #[cfg(unix)]
+            if enabled == Some("true") {
+                let records = diagnostic_records(&directory, 1).await;
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0]["outcome"], "success");
+                let serialized = records[0].to_string();
+                for canary in [
+                    "smoke-session",
+                    "synthetic-prompt-canary",
+                    "test-access",
+                    "acct_test",
+                ] {
+                    assert!(!serialized.contains(canary));
+                }
+            } else {
+                assert!(!directory.exists());
+            }
+        }
+    }
+}
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let value: Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(value["content"][0]["text"], "codex http ok");
-
-    let sent = captured.lock().unwrap().clone().unwrap();
-    assert_eq!(sent["model"], "gpt-5.5");
-    assert_eq!(sent["stream"], true);
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_diagnostics_normal_startup_owns_sink_once() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    let _config = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _enabled = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS", "1");
+    let _no_proxy = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    for (with_monitor, transport) in [(false, "http"), (true, "websocket")] {
+        let directory = config.path().join(format!("startup-{transport}"));
+        let _directory = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS_DIR", &directory);
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", transport);
+        let upstream = if transport == "http" {
+            spawn_http_upstream(|_| buffered_success_sse("startup ok")).await
+        } else {
+            spawn_websocket_upstream(Arc::new(Mutex::new(None))).await
+        };
+        let _upstream = EnvGuard::set("CCP_CODEX_BASE_URL", upstream);
+        let startup_registry = Registry::with_default_alias();
+        assert!(
+            startup_registry
+                .provider_for_model("gpt-5.5", None)
+                .is_some()
+        );
+        assert!(
+            !directory.exists(),
+            "banner/monitor registry must not own a sink"
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(claude_code_proxy::server::serve_listener(
+            listener,
+            with_monitor.then(claude_code_proxy::monitor::MonitorHandle::default),
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client.post(format!("http://{address}/v1/messages"))
+            .header("x-claude-code-session-id", "startup-canary")
+            .json(&json!({"model":"gpt-5.5","max_tokens":64,"messages":[{"role":"user","content":"synthetic startup"}]}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await.unwrap();
+        #[cfg(unix)]
+        {
+            let records = diagnostic_records(&directory, 1).await;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["outcome"], "success");
+        }
+        #[cfg(not(unix))]
+        assert!(!directory.exists());
+        stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        drop(startup_registry);
+    }
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1347,6 +1477,9 @@ async fn smoke_codex_http_retries_empty_completion() {
     let _delay_guard = ZeroRetryDelayGuard::enable();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
+    let directory = config.path().join("diagnostics");
+    let _diagnostics = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS", "1");
+    let _directory = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS_DIR", &directory);
 
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -1381,6 +1514,13 @@ async fn smoke_codex_http_retries_empty_completion() {
         2,
         "empty completion must trigger one retry"
     );
+    #[cfg(unix)]
+    {
+        let records = diagnostic_records(&directory, 1).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["outcome"], "success");
+        assert_eq!(records[0]["input_tokens"], 5);
+    }
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1949,6 +2089,9 @@ async fn smoke_codex_http_stream_returns_before_upstream_completion() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
+    let directory = config.path().join("diagnostics");
+    let _diagnostics = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS", "1");
+    let _directory = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS_DIR", &directory);
 
     let release = Arc::new(tokio::sync::Notify::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1976,10 +2119,12 @@ async fn smoke_codex_http_stream_returns_before_upstream_completion() {
                             1 => {
                                 release.notified().await;
                                 Some((
-                                    Ok(bytes::Bytes::from_static(concat!(
-                                        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
-                                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
-                                    ).as_bytes())),
+                                    Ok(bytes::Bytes::from(format!("{}{}",
+                                        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"more\"}\n\n".repeat(80),
+                                        concat!(
+                                            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+                                        )))),
                                     2,
                                 ))
                             }
@@ -2027,11 +2172,38 @@ async fn smoke_codex_http_stream_returns_before_upstream_completion() {
     assert!(first.contains("event: message_start"));
     assert!(first.contains("event: ping"));
     assert!(first.contains("incremental ok"));
+    #[cfg(unix)]
+    assert_eq!(std::fs::read(directory.join("turns.jsonl")).unwrap(), b"");
 
     release.notify_one();
+    #[cfg(unix)]
+    {
+        let records = diagnostic_records(&directory, 1).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["outcome"], "success");
+        assert_eq!(records[0]["gap"], "unknown");
+    }
     let rest = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let rest = String::from_utf8(rest.to_vec()).unwrap();
     assert!(rest.contains("event: message_stop"), "stream body: {rest}");
+
+    let cancelled_directory = config.path().join("cancelled-diagnostics");
+    let _cancelled_directory =
+        EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS_DIR", &cancelled_directory);
+    let cancelled = call_messages_body(json!({
+        "model":"gpt-5.5", "max_tokens":64, "stream":true,
+        "messages":[{"role":"user","content":"hello"}]
+    }))
+    .await;
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    drop(cancelled);
+    #[cfg(unix)]
+    {
+        let records = diagnostic_records(&cancelled_directory, 1).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["outcome"], "cancelled");
+        assert_eq!(records[0]["cache_hit"], "unknown");
+    }
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2531,6 +2703,9 @@ async fn smoke_codex_http_body_error_after_semantic_output_preserves_message() {
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
+    let directory = config.path().join("diagnostics");
+    let _diagnostics = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS", "1");
+    let _directory = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS_DIR", &directory);
 
     let upstream = spawn_truncated_http_upstream(concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
@@ -2572,6 +2747,13 @@ async fn smoke_codex_http_body_error_after_semantic_output_preserves_message() {
         !text.contains("\"message\":\"http_response_body\""),
         "stream body: {text}"
     );
+    #[cfg(unix)]
+    {
+        let records = diagnostic_records(&directory, 1).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["outcome"], "missing_terminal");
+        assert_eq!(records[0]["cache_hit"], "unknown");
+    }
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2622,6 +2804,9 @@ async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
     let config = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
+    let directory = config.path().join("diagnostics");
+    let _diagnostics = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS", "1");
+    let _directory = EnvGuard::set("CCP_CODEX_THREAD_DIAGNOSTICS_DIR", &directory);
 
     let upstream = spawn_http_upstream(|_body: Value| {
         concat!(
@@ -2649,6 +2834,25 @@ async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
         diagnostic["diagnostics"]["saw_terminal_event"],
         Value::Bool(false)
     );
+    let response = call_messages_body(json!({
+        "model":"gpt-5.5", "max_tokens":64, "stream":true,
+        "messages":[{"role":"user","content":"synthetic truncation"}]
+    }))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("event: error"));
+    #[cfg(unix)]
+    {
+        let records = diagnostic_records(&directory, 2).await;
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert_eq!(record["outcome"], "missing_terminal");
+            assert_eq!(record["cache_hit"], "unknown");
+        }
+    }
 }
 
 #[allow(clippy::await_holding_lock)]

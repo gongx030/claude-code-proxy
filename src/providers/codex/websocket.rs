@@ -62,6 +62,7 @@ pub type CodexWebSocketEventReceiver =
 
 pub(crate) struct CodexWebSocketEventStream {
     receiver: CodexWebSocketEventReceiver,
+    receipt: Option<Arc<Mutex<super::diagnostics::Receipt>>>,
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
     provider_retry_handoff: Arc<AtomicBool>,
@@ -69,6 +70,7 @@ pub(crate) struct CodexWebSocketEventStream {
 
 #[derive(Clone)]
 pub(crate) struct CodexWebSocketSocketIdPublisher {
+    receipt: Option<Arc<Mutex<super::diagnostics::Receipt>>>,
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
     provider_retry_handoff: Arc<AtomicBool>,
@@ -78,22 +80,34 @@ impl CodexWebSocketEventStream {
     pub(crate) fn pending(
         receiver: CodexWebSocketEventReceiver,
     ) -> (Self, CodexWebSocketSocketIdPublisher) {
+        let receipt = super::diagnostics::enabled()
+            .then(|| Arc::new(Mutex::new(super::diagnostics::Receipt::default())));
         let socket_id = Arc::new(AtomicU64::new(0));
         let full_context_retry = Arc::new(AtomicBool::new(false));
         let provider_retry_handoff = Arc::new(AtomicBool::new(false));
         (
             Self {
                 receiver,
+                receipt: receipt.clone(),
                 socket_id: socket_id.clone(),
                 full_context_retry: full_context_retry.clone(),
                 provider_retry_handoff: provider_retry_handoff.clone(),
             },
             CodexWebSocketSocketIdPublisher {
+                receipt,
                 socket_id,
                 full_context_retry,
                 provider_retry_handoff,
             },
         )
+    }
+
+    pub(super) fn observe_with(&self, turn: &super::diagnostics::Turn) {
+        if let Some(receipt) = self.receipt.as_ref()
+            && let Ok(mut receipt) = receipt.lock()
+        {
+            receipt.attach(turn);
+        }
     }
 
     pub(crate) async fn recv(&mut self) -> Option<Result<serde_json::Value, CodexError>> {
@@ -128,6 +142,13 @@ impl CodexWebSocketEventStream {
 }
 
 impl CodexWebSocketSocketIdPublisher {
+    pub(super) fn observe(&self, payload: &serde_json::Value) {
+        if let Some(receipt) = self.receipt.as_ref()
+            && let Ok(mut receipt) = receipt.lock()
+        {
+            receipt.observe(payload);
+        }
+    }
     pub(super) fn publish(&self, socket_id: Option<u64>) {
         self.socket_id
             .store(socket_id.unwrap_or(0), Ordering::Release);
@@ -1086,8 +1107,14 @@ pub(super) fn start_codex_websocket_events(
                 .await;
             return;
         }
-        let (reusable, terminal_item) =
-            stream_ws_events(&mut guard, idle_timeout_ms, traffic, &tx).await;
+        let (reusable, terminal_item) = stream_ws_events(
+            &mut guard,
+            idle_timeout_ms,
+            traffic,
+            &tx,
+            &socket_id_publisher,
+        )
+        .await;
         drop(guard);
 
         let origin_reinserted = if reusable {
@@ -2215,6 +2242,7 @@ async fn stream_ws_events<S>(
     idle_timeout_ms: u64,
     traffic: Option<Arc<TrafficCapture>>,
     tx: &mpsc::Sender<Result<serde_json::Value, CodexError>>,
+    receipt: &CodexWebSocketSocketIdPublisher,
 ) -> (bool, Option<Result<serde_json::Value, CodexError>>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2321,6 +2349,7 @@ where
                     response_started = true;
                     last_response_event_at = Instant::now();
                 }
+                receipt.observe(&parsed);
                 if parsed.get("type").and_then(|value| value.as_str()) == Some("error") {
                     status = event_error_status(&parsed).unwrap_or(500);
                 }

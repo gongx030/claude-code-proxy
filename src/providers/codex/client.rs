@@ -1145,6 +1145,16 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
+        self.stream_codex_http_events_observed(body, ctx, None)
+            .await
+    }
+
+    async fn stream_codex_http_events_observed(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        turn: Option<super::diagnostics::Turn>,
+    ) -> Result<CodexHttpEventReceiver, CodexError> {
         let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -1203,15 +1213,19 @@ impl CodexHttpClient {
                 retries,
             },
             ctx.clone(),
+            turn,
         ))
     }
 
-    pub(crate) async fn stream_codex_http_events_for_owner(
+    pub(super) async fn stream_codex_http_events_for_owner_observed(
         self: &Arc<Self>,
         body: &ResponsesRequest,
         ctx: &RequestContext,
+        turn: Option<super::diagnostics::Turn>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let receiver = self.stream_codex_http_events(body, ctx).await?;
+        let receiver = self
+            .stream_codex_http_events_observed(body, ctx, turn)
+            .await?;
         let (stream, _) = super::websocket::CodexWebSocketEventStream::pending(receiver);
         Ok(stream)
     }
@@ -1279,12 +1293,24 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        self.stream_codex_auto_events_for_owner_observed(body, ctx, continuation, None)
+            .await
+    }
+
+    pub(super) async fn stream_codex_auto_events_for_owner_observed(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+        turn: Option<super::diagnostics::Turn>,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let mut websocket = self
-            .stream_codex_websocket_events_for_owner(body, ctx, continuation)
+            .stream_codex_websocket_events_for_owner_observed(body, ctx, continuation, turn.clone())
             .await?;
         match websocket.recv().await {
             Some(Err(err)) if should_fallback_to_http(&err) => {
-                self.stream_codex_http_events_for_owner(body, ctx).await
+                self.stream_codex_http_events_for_owner_observed(body, ctx, turn)
+                    .await
             }
             Some(item) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -1311,6 +1337,7 @@ impl CodexHttpClient {
         self: &Arc<Self>,
         state: HttpEventStreamState,
         ctx: RequestContext,
+        turn: Option<super::diagnostics::Turn>,
     ) -> CodexHttpEventReceiver {
         let HttpEventStreamState {
             mut resp,
@@ -1330,6 +1357,10 @@ impl CodexHttpClient {
 
         tokio::spawn(async move {
             let log = create_logger("codex");
+            let mut receipt = super::diagnostics::Receipt::default();
+            if let Some(turn) = turn.as_ref() {
+                receipt.attach(turn);
+            }
             let mut semantic_output_forwarded = false;
 
             if tx
@@ -1513,6 +1544,9 @@ impl CodexHttpClient {
                         }
 
                         let terminal = super::events::event_is_terminal(&payload);
+                        if turn.is_some() {
+                            receipt.observe(&payload);
+                        }
                         match event_kind {
                             super::events::CodexStreamEventKind::TerminalFailure => {
                                 if !semantic_output_forwarded {
@@ -2019,6 +2053,17 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        self.stream_codex_websocket_events_for_owner_observed(body, ctx, continuation, None)
+            .await
+    }
+
+    pub(super) async fn stream_codex_websocket_events_for_owner_observed(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+        turn: Option<super::diagnostics::Turn>,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -2050,6 +2095,7 @@ impl CodexHttpClient {
                     auth,
                     tx,
                     socket_id_publisher,
+                    turn,
                 )
                 .await;
         });
@@ -2066,6 +2112,7 @@ impl CodexHttpClient {
         mut auth: StoredAuth,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
         socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
+        turn: Option<super::diagnostics::Turn>,
     ) {
         let mut auth_refresh_attempted = false;
         let mut continuation_retry_available = continuation
@@ -2168,6 +2215,9 @@ impl CodexHttpClient {
                 }
             };
 
+            if let Some(turn) = turn.as_ref() {
+                stream.observe_with(turn);
+            }
             let mut pending_events = Vec::new();
             loop {
                 let item = tokio::select! {
