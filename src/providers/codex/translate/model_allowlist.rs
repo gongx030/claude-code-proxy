@@ -18,6 +18,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-luna",
     "gpt-6-sol",
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -131,6 +132,7 @@ pub fn uses_responses_lite(model: &str) -> bool {
             | "gpt-6-luna"
             | "gpt-6-sol"
             | "gpt-6.1-sol"
+            | "gpt-6.1-terra"
     )
 }
 
@@ -242,6 +244,18 @@ mod tests {
         assert!(assert_allowed_model("gpt-6-astra").is_ok());
         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
         assert!(assert_allowed_model("gpt-6.1-sol").is_ok());
+        assert!(assert_allowed_model("gpt-6.1-terra").is_ok());
+    }
+
+    #[test]
+    fn gpt_6_1_sol_and_terra_are_accepted_with_fast_alias_on_lite() {
+        for model in ["gpt-6.1-sol", "gpt-6.1-terra"] {
+            assert!(assert_allowed_model(model).is_ok(), "{model}");
+            assert!(uses_responses_lite(model), "{model}");
+            let fast = resolve_model_request(&format!("{model}-fast"));
+            assert_eq!(fast.model, model);
+            assert_eq!(fast.service_tier, Some(ServiceTier::Priority));
+        }
     }
 
     #[test]

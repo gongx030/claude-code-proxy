@@ -451,7 +451,7 @@ impl Turn {
             };
             pending.record.model = match model {
                 "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6.1-sol" => Model::Sol,
-                "gpt-5.6-terra" | "gpt-6-terra" => Model::Terra,
+                "gpt-5.6-terra" | "gpt-6-terra" | "gpt-6.1-terra" => Model::Terra,
                 "gpt-5.6-luna" | "gpt-6-luna" => Model::Luna,
                 _ => Model::Other,
             };
