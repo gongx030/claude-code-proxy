@@ -83,6 +83,7 @@ fn configure_environment(config_dir: &Path, upstream_url: &str) -> Vec<EnvGuard>
         "CCP_CODEX_MODEL",
         "CCP_CODEX_SERVICE_TIER",
         "CCP_CODEX_EFFORT",
+        "CCP_CODEX_FULL_LANE",
         "CCP_CODEX_REASONING_SUMMARY",
         "CCP_CODEX_PROMPT_CACHE_KEY",
         "CCP_CODEX_ORIGINATOR",
@@ -1463,7 +1464,12 @@ fn classifier_translation_defaults_preserve_normal_bodies() {
                 // Auto-review has no conversation identity, so thread mode resolves to session.
                 let key = session.filter(|_| mode != "omit").map(str::to_owned);
                 for lite in [false, true] {
-                    for model in ["gpt-6-luna", "gpt-6.1-sol", "gpt-5.6-terra"] {
+                    for model in [
+                        "gpt-6-luna",
+                        "gpt-6.1-sol",
+                        "gpt-6.1-terra",
+                        "gpt-5.6-terra",
+                    ] {
                         let mut source = json!({
                             "model": model,
                             "codex_auto_review": true,
@@ -1677,6 +1683,70 @@ async fn auto_review_with_agent_headers_is_stateless() {
             assert!(classifier.body.get("include").is_none());
             assert!(classifier.body.get("previous_response_id").is_none());
         }
+    }
+    harness.shutdown().await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_review_classifier_keeps_guardian_defaults_on_both_lanes() {
+    let _environment_lock = env_lock();
+    let mut harness = TestHarness::start().await;
+    let review_system = "You are a security monitor for autonomous AI coding agents.\n\n## Context";
+
+    for full_lane in ["0", "1"] {
+        let _lane = EnvGuard::set("CCP_CODEX_FULL_LANE", full_lane);
+        let _review_model = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "gpt-6.1-terra");
+        let case = unique(&format!("lane-{full_lane}"));
+        let session = tagged(&case, "session");
+        let headers = IdentityHeaders::agent(&session, &tagged(&case, "agent"), None);
+        let normal_text = tagged(&case, "normal");
+        let review = tagged(&case, "review-command");
+
+        let normal = harness
+            .round_trip(
+                messages_body(false, vec![message("user", &normal_text)]),
+                headers.clone(),
+                &normal_text,
+                &tagged(&case, "resp-normal"),
+                &tagged(&case, "normal-reply"),
+            )
+            .await;
+        let classifier = harness
+            .round_trip(
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "max_tokens": 64,
+                    "stream": false,
+                    "system": [{"type": "text", "text": review_system}],
+                    "messages": [{"role": "user", "content": review}],
+                    "tools": []
+                }),
+                headers,
+                &review,
+                &tagged(&case, "resp-review"),
+                &tagged(&case, "review-reply"),
+            )
+            .await;
+
+        let full = full_lane == "1";
+        for (request, model) in [(&normal, "gpt-5.6-sol"), (&classifier, "gpt-6.1-terra")] {
+            assert_eq!(request.body["model"], model);
+            assert_eq!(request.body["parallel_tool_calls"], full, "{model}");
+            assert_eq!(
+                request.body.get("client_metadata").is_some(),
+                !full,
+                "{model}"
+            );
+        }
+        assert_eq!(normal.body["prompt_cache_key"], session);
+        assert_eq!(
+            classifier.body["prompt_cache_key"],
+            format!("guardian:{session}")
+        );
+        assert_eq!(classifier.body["reasoning"]["effort"], "low");
+        assert!(classifier.body["reasoning"].get("summary").is_none());
+        assert!(classifier.body.get("include").is_none());
     }
     harness.shutdown().await;
 }

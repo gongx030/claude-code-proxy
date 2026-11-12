@@ -66,6 +66,7 @@ impl Drop for EnvGuard {
 fn isolated_environment(config_dir: &Path) -> Vec<EnvGuard> {
     let mut guards = vec![
         EnvGuard::unset("CCP_CODEX_EFFORT"),
+        EnvGuard::unset("CCP_CODEX_FULL_LANE"),
         EnvGuard::unset("CCP_CODEX_REASONING_SUMMARY"),
         EnvGuard::unset("CCP_COMPACT_EFFORT"),
     ];

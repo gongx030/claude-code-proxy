@@ -2881,14 +2881,16 @@ mod tests {
     const LITE_MODEL: &str = "gpt-6.1-sol";
     const FULL_MODEL: &str = "gpt-6.1-terra";
 
-    fn wire_for(model: &str, req_json: Value) -> Value {
+    fn wire_for(model: &str, full_lane: bool, req_json: Value) -> Value {
         let req: MessagesRequest = serde_json::from_value(req_json).unwrap();
         let out = translate_request(
             &req,
             TranslateOptions {
                 model: model.to_string(),
                 use_responses_lite:
-                    crate::providers::codex::translate::model_allowlist::uses_responses_lite(model),
+                    crate::providers::codex::translate::model_allowlist::uses_responses_lite_with_full_lane(
+                        model, full_lane,
+                    ),
                 ..opts()
             },
         )
@@ -2928,7 +2930,13 @@ mod tests {
     #[test]
     fn tool_search_sequence_is_cache_stable_and_placeholder_free_on_both_lanes() {
         let lite: Vec<Value> = (1..=3)
-            .map(|s| wire_for(LITE_MODEL, with_model(tool_search_step(s), LITE_MODEL)))
+            .map(|s| {
+                wire_for(
+                    LITE_MODEL,
+                    false,
+                    with_model(tool_search_step(s), LITE_MODEL),
+                )
+            })
             .collect();
         for pair in lite.windows(2) {
             let (a, b) = (
@@ -2945,7 +2953,11 @@ mod tests {
         assert!(lite_input.contains("Tool loaded: mcp__mail__search"));
         assert!(!lite_input.contains("tool_reference"));
         for step in 1..=3 {
-            let full = wire_for(FULL_MODEL, with_model(tool_search_step(step), FULL_MODEL));
+            let full = wire_for(
+                FULL_MODEL,
+                true,
+                with_model(tool_search_step(step), FULL_MODEL),
+            );
             assert!(
                 !lite[step - 1]
                     .to_string()
@@ -2984,7 +2996,10 @@ mod tests {
                 {"type":"tool_result","tool_use_id":"tu_1","content":"a.txt"},
                 {"type":"tool_result","tool_use_id":"tu_2","content":"/x"}]}],
             "tools":[{"name":"Bash","description":"run","input_schema":schema}]});
-        (wire_for(LITE_MODEL, plain), wire_for(FULL_MODEL, parallel))
+        (
+            wire_for(LITE_MODEL, false, plain),
+            wire_for(FULL_MODEL, true, parallel),
+        )
     }
 
     /// Goldens were captured from the translation before tool-search support.

@@ -53,7 +53,7 @@ use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
-    uses_responses_lite,
+    uses_responses_lite_with_full_lane,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
@@ -218,7 +218,8 @@ impl CodexProvider {
                 ctx.traffic.as_deref(),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let use_responses_lite =
+            apply_model_lane_for_request(&mut resolved.model, &body, config::codex_full_lane());
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -636,7 +637,8 @@ impl Provider for CodexProvider {
                 ),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let use_responses_lite =
+            apply_model_lane_for_request(&mut resolved.model, &body, config::codex_full_lane());
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -678,12 +680,16 @@ impl Provider for CodexProvider {
 /// run on the full Responses API (the lite lane rejects hosted tools), and
 /// lite-only models like gpt-5.6-luna don't exist there, so such requests
 /// are upgraded to a full-lane model. Returns whether to use the lite lane.
-fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> bool {
+fn apply_model_lane_for_request(
+    model: &mut String,
+    body: &MessagesRequest,
+    full_lane: bool,
+) -> bool {
     if has_hosted_web_search(body) {
         *model = full_lane_web_search_model(model).to_string();
         return false;
     }
-    uses_responses_lite(model)
+    uses_responses_lite_with_full_lane(model, full_lane)
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
@@ -1985,10 +1991,56 @@ mod tests {
             ("gpt-6-sol", "gpt-6-sol"),
             ("gpt-5.4", "gpt-5.4"),
         ] {
-            let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
-            assert!(!lite, "{resolved} with web_search must use the full lane");
-            assert_eq!(model, expected);
+            for full_lane in [false, true] {
+                let mut model = resolved.to_string();
+                let lite = apply_model_lane_for_request(&mut model, &body, full_lane);
+                assert!(!lite, "{resolved} with web_search must use the full lane");
+                assert_eq!(model, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn full_lane_translation_preserves_parallel_tool_restrictions() {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-5.6-luna",
+            "gpt-6-luna",
+        ] {
+            let luna = model.contains("luna");
+            for full_lane in [false, true] {
+                for disable_parallel in [false, true] {
+                    let mut body = request_with_tools(serde_json::json!([
+                        {"name":"Read", "input_schema":{"type":"object"}}
+                    ]));
+                    body.extra.insert(
+                        "tool_choice".to_string(),
+                        serde_json::json!({"type":"auto", "disable_parallel_tool_use":disable_parallel}),
+                    );
+                    let mut resolved = model.to_string();
+                    let lite = apply_model_lane_for_request(&mut resolved, &body, full_lane);
+                    assert_eq!(lite, !full_lane || luna, "{model} full_lane={full_lane}");
+                    let translated = translate_request(
+                        &body,
+                        TranslateOptions {
+                            prompt_cache_key: None,
+                            service_tier: None,
+                            model: resolved,
+                            use_responses_lite: lite,
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(translated.model, model);
+                    assert_eq!(translated.client_metadata.is_some(), lite);
+                    assert_eq!(translated.parallel_tool_calls, !lite && !disable_parallel);
+                    assert_eq!(translated.tools.is_some(), !lite);
+                }
+            }
         }
     }
 
@@ -2005,7 +2057,7 @@ mod tests {
             ("gpt-5.4", false),
         ] {
             let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
+            let lite = apply_model_lane_for_request(&mut model, &body, false);
             assert_eq!(model, resolved, "model must not change without web_search");
             assert_eq!(lite, lite_expected);
         }
