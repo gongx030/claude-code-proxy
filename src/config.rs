@@ -63,6 +63,8 @@ struct CodexConfig {
     pub responses_api: Option<bool>,
     #[serde(rename = "fullLane")]
     pub full_lane: Option<bool>,
+    #[serde(rename = "authReadOnly")]
+    pub auth_read_only: Option<bool>,
     #[serde(rename = "imagesApi")]
     pub images_api: Option<bool>,
     #[serde(rename = "imagesBaseUrl")]
@@ -269,6 +271,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_FULL_LANE") {
         out.push("codex.fullLane (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_AUTH_READONLY") {
+        out.push("codex.authReadOnly (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_IMAGES_API") {
         out.push("codex.imagesApi (env)".to_string());
     }
@@ -380,6 +385,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if codex.full_lane == Some(true) {
                 out.push("codex.fullLane: true".to_string());
+            }
+            if codex.auth_read_only == Some(true) {
+                out.push("codex.authReadOnly: true".to_string());
             }
             if codex.images_api == Some(true) {
                 out.push("codex.imagesApi: true".to_string());
@@ -808,6 +816,26 @@ pub fn codex_full_lane() -> bool {
     false
 }
 
+/// Whether this listener must only read the Codex token store (never refresh,
+/// save or clear it). Env wins over file. Unlike the lenient lane flags, an
+/// unrecognized env value is an error so a typo cannot silently leave the
+/// listener read-write.
+pub fn codex_auth_read_only() -> anyhow::Result<bool> {
+    if let Ok(raw) = std::env::var("CCP_CODEX_AUTH_READONLY") {
+        return match raw.trim() {
+            "" | "0" => Ok(false),
+            "1" => Ok(true),
+            other => anyhow::bail!(
+                "invalid CCP_CODEX_AUTH_READONLY value {other:?}: expected 1, 0 or empty"
+            ),
+        };
+    }
+    Ok(read_file_config(&paths::config_dir())
+        .and_then(|file| file.codex)
+        .and_then(|codex| codex.auth_read_only)
+        .unwrap_or(false))
+}
+
 pub fn codex_responses_api() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
@@ -1117,6 +1145,7 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_PROMPT_CACHE_KEY"),
             EnvGuard::unset("CCP_CODEX_RESPONSES_API"),
             EnvGuard::unset("CCP_CODEX_FULL_LANE"),
+            EnvGuard::unset("CCP_CODEX_AUTH_READONLY"),
             EnvGuard::unset("CCP_CODEX_IMAGES_API"),
             EnvGuard::unset("CCP_CODEX_IMAGES_BASE_URL"),
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
@@ -1414,6 +1443,30 @@ mod tests {
         ] {
             let _flag = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
             assert_eq!(codex_full_lane(), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn codex_auth_read_only_defaults_off_env_wins_and_rejects_invalid_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        assert!(!codex_auth_read_only().unwrap());
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"authReadOnly":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_auth_read_only().unwrap());
+        for (value, expected) in [("1", true), ("0", false), ("", false), ("  ", false)] {
+            let _flag = EnvGuard::set("CCP_CODEX_AUTH_READONLY", value);
+            assert_eq!(codex_auth_read_only().unwrap(), expected, "{value:?}");
+        }
+        for value in ["true", "yes", "2", "invalid"] {
+            let _flag = EnvGuard::set("CCP_CODEX_AUTH_READONLY", value);
+            let err = codex_auth_read_only().unwrap_err().to_string();
+            assert!(err.contains("CCP_CODEX_AUTH_READONLY"), "{value:?}: {err}");
         }
     }
 

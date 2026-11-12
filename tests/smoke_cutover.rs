@@ -981,7 +981,9 @@ async fn smoke_healthz_returns_ok() {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap();
-    assert_eq!(body, json!({"ok": true}));
+    assert_eq!(body["ok"], json!(true));
+    assert!(body.get("codex_auth_mode").is_some());
+    assert!(body.get("codex_auth_expires_in_s").is_some());
 }
 
 #[tokio::test]

@@ -14,10 +14,10 @@ The server exposes the Anthropic and OpenAI routes supported by the proxy. Each 
 Liveness check:
 
 ```json
-{"ok":true}
+{"ok":true,"codex_auth_mode":"read_write","codex_auth_expires_in_s":3417}
 ```
 
-It does not verify provider credentials or upstream availability.
+`codex_auth_mode` is `read_write` or `read_only` (see `CCP_CODEX_AUTH_READONLY`). `codex_auth_expires_in_s` is the seconds until the stored Codex access token expires (negative once expired), or `null` when no Codex login is stored or readable. The response contains no token, account id or path. It does not verify provider credentials or upstream availability.
 
 ## `GET /monitor`
 

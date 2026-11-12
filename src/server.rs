@@ -340,7 +340,22 @@ async fn handler_monitor(
 }
 
 async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({ "ok": true }))
+    // An unreadable setting reports read_only: the client fails closed too.
+    let read_only = crate::config::codex_auth_read_only().unwrap_or(true);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let (mode, expires_in_s) = crate::providers::codex::auth::manager::auth_health(
+        &crate::providers::codex::auth::token_store::file_store(),
+        read_only,
+        now_ms,
+    );
+    Json(json!({
+        "ok": true,
+        "codex_auth_mode": mode,
+        "codex_auth_expires_in_s": expires_in_s,
+    }))
 }
 
 #[derive(serde::Deserialize)]

@@ -718,7 +718,10 @@ impl CodexHttpClient {
             websocket_client: websocket_http_client(&proxy_environment),
             websocket_proxy_config: proxy_environment.websocket_proxy_config(),
             auto_http_fallback_enabled: true,
-            auth_manager: CodexAuthManager::new(file_store()),
+            // Startup rejects an invalid value; if one still reaches here,
+            // fail closed (never write) rather than open.
+            auth_manager: CodexAuthManager::new(file_store())
+                .with_read_only(config::codex_auth_read_only().unwrap_or(true)),
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,

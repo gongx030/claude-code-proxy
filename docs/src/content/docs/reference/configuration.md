@@ -29,6 +29,7 @@ These settings configure the proxy process. Claude Code client settings such as 
     "serverCompaction": false,
     "responsesApi": false,
     "fullLane": false,
+    "authReadOnly": false,
     "imagesApi": false,
     "imagesBaseUrl": "https://chatgpt.com/backend-api/codex"
   },
@@ -115,6 +116,7 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CODEX_PROMPT_CACHE_KEY` | `codex.promptCacheKey` | `session` | Experiment knob for the Responses `prompt_cache_key`: `session` sends the Claude Code session id, `thread` gives each distinct subagent id a distinct derived key and keeps the session id for the main thread, `omit` sends none. An empty value is treated as unset; other invalid values stop startup. |
 | `CCP_CODEX_SERVER_COMPACTION` | `codex.serverCompaction` | `false` | Enables or disables native compaction for standard boolean words. |
 | `CCP_CODEX_RESPONSES_API` | `codex.responsesApi` | `false` | Enables `/v1/responses` and `/v1/chat/completions` for every registered provider. Accepts `1`, `true`, or `yes`. |
+| `CCP_CODEX_AUTH_READONLY` | `codex.authReadOnly` | `false` | Makes this listener read the Codex token store without ever refreshing, saving or clearing it, so a second listener sharing the store cannot log the first out. Accepts `1`, `0` or empty (off); any other env value stops startup. See [Sharing a token store](/providers/codex/#sharing-a-token-store). |
 | `CCP_CODEX_FULL_LANE` | `codex.fullLane` | `false` | Enables parallel tool calls on the six [supported full-lane models](/providers/codex/#responses-lanes-and-parallel-tools); Luna stays on Responses Lite. Accepts `1`, `true`, or `yes`; any other value, including `0`, disables it and overrides the file. |
 | `CCP_CODEX_IMAGES_API` | `codex.imagesApi` | `false` | Enables `/v1/images/generations` and `/v1/images/edits` for `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_BASE_URL` | `codex.imagesBaseUrl` | `https://chatgpt.com/backend-api/codex` | Sets the trusted Codex Images API root; production use is restricted to HTTPS `chatgpt.com/backend-api/codex`. |

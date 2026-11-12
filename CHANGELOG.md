@@ -11,6 +11,10 @@ description: Release notes for claude-code-proxy.
   Sol, Terra and Astra models from Responses Lite to the full Responses lane,
   which allows parallel tool calls. Luna stays on Lite, and
   `CCP_CODEX_FULL_LANE=0` disables the setting over the config file.
+- Codex: the opt-in `CCP_CODEX_AUTH_READONLY` / `codex.authReadOnly` mode lets
+  a secondary listener read a shared token store without ever refreshing,
+  saving or clearing it. `GET /healthz` now also reports `codex_auth_mode` and
+  `codex_auth_expires_in_s`. Default behavior is unchanged.
 - Codex: the new `CCP_CODEX_PROMPT_CACHE_KEY` / `codex.promptCacheKey` setting
   is an experiment knob for `prompt_cache_key`. `session` (default, unchanged)
   sends the session id, `thread` gives each distinct subagent id a distinct derived key, and `omit`

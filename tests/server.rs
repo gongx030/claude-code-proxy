@@ -446,7 +446,13 @@ async fn healthz_returns_ok() {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap();
-    assert_eq!(body, json!({"ok": true}));
+    assert_eq!(body["ok"], json!(true));
+    assert!(matches!(
+        body["codex_auth_mode"].as_str(),
+        Some("read_write" | "read_only")
+    ));
+    assert!(body["codex_auth_expires_in_s"].is_null() || body["codex_auth_expires_in_s"].is_i64());
+    assert_eq!(body.as_object().unwrap().len(), 3);
 }
 
 #[tokio::test]
