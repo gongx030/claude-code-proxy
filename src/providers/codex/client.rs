@@ -699,6 +699,29 @@ pub struct CodexHttpClient {
     body_idle_timeout_ms: u64,
 }
 
+/// The token-store manager for the configured auth mode. Startup rejects an
+/// invalid setting; if one still reaches here it fails closed (read-only, never
+/// writes) and is logged.
+pub fn auth_manager_from_config() -> CodexAuthManager<DefaultCodexAuthStore> {
+    auth_manager_for_setting(config::codex_auth_read_only())
+}
+
+fn auth_manager_for_setting(
+    setting: anyhow::Result<bool>,
+) -> CodexAuthManager<DefaultCodexAuthStore> {
+    let read_only = setting.unwrap_or_else(|err| {
+        create_logger("codex").warn(
+            "codex_auth_read_only_setting_invalid_failing_closed",
+            Some(serde_json::Map::from_iter([(
+                "error".to_string(),
+                serde_json::json!(err.to_string()),
+            )])),
+        );
+        true
+    });
+    CodexAuthManager::new(file_store()).with_read_only(read_only)
+}
+
 impl Default for CodexHttpClient {
     fn default() -> Self {
         Self::new()
@@ -718,7 +741,7 @@ impl CodexHttpClient {
             websocket_client: websocket_http_client(&proxy_environment),
             websocket_proxy_config: proxy_environment.websocket_proxy_config(),
             auto_http_fallback_enabled: true,
-            auth_manager: CodexAuthManager::new(file_store()),
+            auth_manager: auth_manager_from_config(),
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
@@ -3165,6 +3188,17 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn client_auth_manager_follows_setting_and_fails_closed() {
+        for (setting, read_only) in [
+            (Ok(true), true),
+            (Ok(false), false),
+            (Err(anyhow::anyhow!("bad config")), true),
+        ] {
+            assert_eq!(auth_manager_for_setting(setting).is_read_only(), read_only);
+        }
+    }
 
     fn test_continuation(
         owner: Option<ConversationIdentity>,

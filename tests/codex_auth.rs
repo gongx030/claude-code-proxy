@@ -120,3 +120,29 @@ fn codex_auth_status_expired_auth_shows_negative_seconds() -> Result<(), Box<dyn
     assert!(lines[2].starts_with("Storage: "), "{out}");
     Ok(())
 }
+
+#[test]
+fn codex_auth_write_commands_refuse_in_read_only_mode() -> Result<(), Box<dyn std::error::Error>> {
+    for subcommand in ["login", "device", "logout"] {
+        let temp = TempDir::new()?;
+        let auth_dir = temp.path().join("codex");
+        std::fs::create_dir_all(&auth_dir)?;
+        let auth = r#"{"access":"a","refresh":"r","expires":4102444800000,"accountId":"acct_1"}"#;
+        std::fs::write(auth_dir.join("auth.json"), auth)?;
+        let output = Command::cargo_bin("claude-code-proxy")?
+            .args(["codex", "auth", subcommand])
+            .env("CCP_CONFIG_DIR", temp.path())
+            .env("HOME", temp.path())
+            .env("CCP_CODEX_AUTH_READONLY", "1")
+            .output()?;
+        assert!(!output.status.success(), "{subcommand} must fail");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("read-only"), "{subcommand}: {stderr}");
+        assert_eq!(
+            std::fs::read_to_string(auth_dir.join("auth.json"))?,
+            auth,
+            "{subcommand} modified the token store"
+        );
+    }
+    Ok(())
+}

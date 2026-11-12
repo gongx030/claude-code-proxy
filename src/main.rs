@@ -101,6 +101,7 @@ fn main() -> Result<()> {
         }
         Commands::Serve { port, no_monitor } => {
             config::codex_prompt_cache_key_mode()?;
+            config::codex_auth_read_only()?;
             let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
             let registry = Registry::with_default_alias();

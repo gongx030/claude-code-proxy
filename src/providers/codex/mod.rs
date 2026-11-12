@@ -1684,6 +1684,7 @@ pub(crate) struct CodexCli;
 
 impl CliHandlers for CodexCli {
     fn login(&self) -> Result<(), anyhow::Error> {
+        refuse_store_write_when_read_only()?;
         let tokens = run_browser_login()?;
         let store = file_store();
         let manager = CodexAuthManager::new(store);
@@ -1696,6 +1697,7 @@ impl CliHandlers for CodexCli {
     }
 
     fn device(&self) -> Result<(), anyhow::Error> {
+        refuse_store_write_when_read_only()?;
         let tokens = DeviceAuthClient::new().run()?;
         let store = file_store();
         let manager = CodexAuthManager::new(store);
@@ -1727,6 +1729,7 @@ impl CliHandlers for CodexCli {
     }
 
     fn logout(&self) -> Result<(), anyhow::Error> {
+        refuse_store_write_when_read_only()?;
         let store = file_store();
         store.clear_auth()?;
         println!("Logged out");
@@ -1735,6 +1738,17 @@ impl CliHandlers for CodexCli {
 }
 
 pub(crate) static CODEX_CLI: CodexCli = CodexCli;
+
+/// Login, device login and logout rewrite the token store; a read-only
+/// process (CCP_CODEX_AUTH_READONLY) must not run them. `status` only reads.
+fn refuse_store_write_when_read_only() -> Result<(), anyhow::Error> {
+    if config::codex_auth_read_only()? {
+        anyhow::bail!(
+            "codex auth is read-only (CCP_CODEX_AUTH_READONLY): refusing to modify the token store"
+        );
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // CLI helpers

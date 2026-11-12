@@ -10,6 +10,7 @@ use crate::{
     project,
     provider::RequestContext,
     providers::codex::{
+        auth::{manager::CodexAuthManager, token_store::DefaultCodexAuthStore},
         chat_completions::{ChatCompletionsBackend, request::translate_request},
         images::{
             CodexImagesBackend, ImageOperation, ImageRequestError, MAX_EDIT_REQUEST_BYTES,
@@ -259,6 +260,7 @@ pub fn app_with_features(
         chat_completions,
         images,
         transcriptions,
+        codex_auth: Arc::new(crate::providers::codex::client::auth_manager_from_config()),
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
@@ -303,6 +305,9 @@ struct AppState {
     chat_completions: Option<Arc<ChatCompletionsBackend>>,
     images: Option<Arc<CodexImagesBackend>>,
     transcriptions: Option<Arc<CodexTranscriptionBackend>>,
+    /// Auth manager resolved once at router construction; `/healthz` reports
+    /// its mode rather than re-reading configuration per request.
+    codex_auth: Arc<CodexAuthManager<DefaultCodexAuthStore>>,
 }
 
 async fn handler_monitor(
@@ -339,8 +344,37 @@ async fn handler_monitor(
     }
 }
 
-async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({ "ok": true }))
+async fn healthz(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    // The token-store read is blocking disk I/O: keep it off the async worker.
+    let auth = state.codex_auth.clone();
+    let (mode, expires_in_s) = tokio::task::spawn_blocking(move || auth.health(now_ms))
+        .await
+        .unwrap_or_else(|err| {
+            create_logger("server").warn(
+                "codex auth health task failed",
+                Some(Map::from_iter([(
+                    "error".to_string(),
+                    json!(err.to_string()),
+                )])),
+            );
+            (
+                if state.codex_auth.is_read_only() {
+                    "read_only"
+                } else {
+                    "read_write"
+                },
+                None,
+            )
+        });
+    Json(json!({
+        "ok": true,
+        "codex_auth_mode": mode,
+        "codex_auth_expires_in_s": expires_in_s,
+    }))
 }
 
 #[derive(serde::Deserialize)]

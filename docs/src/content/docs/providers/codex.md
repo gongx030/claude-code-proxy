@@ -32,6 +32,12 @@ Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6
 
 Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service. `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence.
 
+## Sharing a token store
+
+Refresh tokens rotate, and the refresh lock is local to one process. Two listeners that refresh the same token store at the same time can invalidate each other's token and leave the account logged out. Run exactly one read-write listener (the owner) and start every other listener that shares its store with `CCP_CODEX_AUTH_READONLY=1` (or `codex.authReadOnly: true`).
+
+A read-only listener re-reads the store on each request and uses the stored token while it is valid for more than 60 seconds. It never contacts the token endpoint and never writes or deletes the store, including after an upstream 401 (it then uses the token only if the owner has replaced it). When the stored token is expired or about to expire, requests fail with an error asking the owner to refresh. With no stored login, the error says the owning listener must log in, because this mode refuses login. `codex auth login`, `device` and `logout` refuse to run in that mode. `GET /healthz` reports `codex_auth_mode` and `codex_auth_expires_in_s` so you can check that the owner keeps the token fresh.
+
 ## Responses lanes and parallel tools
 
 The gpt-5.6 and gpt-6 families use Responses Lite by default. Lite requires `parallel_tool_calls: false`, so function tools run serially. Set `codex.fullLane: true` or `CCP_CODEX_FULL_LANE=1` to use the full Responses lane for `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`, and `gpt-6.1-terra`. This permits parallel tool calls; the model still decides whether to batch tools, and an explicit client restriction on parallel tools remains effective. `CCP_CODEX_FULL_LANE=0` disables the setting and takes precedence over the config file.
