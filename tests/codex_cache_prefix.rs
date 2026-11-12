@@ -1,6 +1,7 @@
 //! Prompt-prefix stability of the Anthropic -> Codex Responses translation, both
 //! lanes (gongx030/claude-code-proxy#12). Offline: synthetic fake text, no
-//! network, hermetic config dir. Structural byte facts, not cache-hit claims.
+//! network, hermetic config dir. Structural facts about the translated request
+//! (canonical-JSON input items and top-level fields), not cache-hit claims.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -21,10 +22,13 @@ use claude_code_proxy::providers::codex::translate::request::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-const MODEL: &str = "gpt-6-luna";
+const MODEL: &str = "gpt-6.1-sol";
 const CACHE_KEY: &str = "sess-fake-0001";
 const MAIN_PROMPT: &str = "You are a fake CLI agent. Fake main system prompt.";
-const SUMMARIZER_PROMPT: &str = "You are a fake assistant that summarizes conversations.";
+// Contains request.rs COMPACT_SYSTEM_MARKER (system-prompt compaction form).
+const SUMMARIZER_PROMPT: &str =
+    "You are a helpful AI assistant tasked with summarizing conversations. Fake summarizer.";
+// Contains request.rs COMPACT_MESSAGE_PREFIX and COMPACT_MESSAGE_TASK (message form).
 const COMPACT_INSTRUCTION: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools. \
 Your task is to create a detailed summary of the conversation so far";
 const SUMMARY: &str = "Fake portable summary of the earlier conversation, long enough to anchor \
@@ -251,10 +255,29 @@ fn subagent_request(later: bool) -> Value {
     )
 }
 
-fn compaction_request(stage: usize, prompt: &str) -> Value {
+/// The two compaction forms request.rs detects.
+#[derive(Clone, Copy, Debug)]
+enum Compact {
+    /// Compaction user message under the main prompt (`is_compact_message_text`).
+    Message,
+    /// Summarizer system prompt (`is_compact_request`); the final user message is ordinary.
+    SystemMarker,
+}
+
+fn compaction_request(stage: usize, form: Compact) -> Value {
     let mut m = main_history(stage);
-    m.push(json!({"role": "user", "content": [{"type": "text", "text": COMPACT_INSTRUCTION}]}));
+    let (prompt, text) = match form {
+        Compact::Message => (MAIN_PROMPT, COMPACT_INSTRUCTION),
+        Compact::SystemMarker => (SUMMARIZER_PROMPT, "fake summarize request"),
+    };
+    m.push(json!({"role": "user", "content": [{"type": "text", "text": text}]}));
     request(system(99, prompt), main_tools(stage >= 2), m)
+}
+
+/// Compaction detection caps effort `high` -> `low` (CCP_COMPACT_EFFORT cleared).
+fn assert_compaction_detected(prev: &Value, comp: &Value, label: &str) {
+    assert_eq!(prev["reasoning"]["effort"], "high", "{label}");
+    assert_eq!(comp["reasoning"]["effort"], "low", "{label}");
 }
 
 fn post_compaction_request(loaded_before: bool) -> Value {
@@ -272,29 +295,30 @@ fn post_compaction_request(loaded_before: bool) -> Value {
 // Translation and structural comparison
 // ---------------------------------------------------------------------------
 
-fn translate_req(req: &MessagesRequest, lite: bool) -> ResponsesRequest {
+/// Lane chosen as production does: `full_lane=false` -> Lite, `true` -> full.
+fn translate_req(req: &MessagesRequest, full_lane: bool) -> ResponsesRequest {
     translate_request(
         req,
         TranslateOptions {
             prompt_cache_key: Some(CACHE_KEY.to_string()),
             service_tier: None,
             model: MODEL.to_string(),
-            use_responses_lite: lite,
+            use_responses_lite: uses_responses_lite_with_full_lane(MODEL, full_lane),
         },
     )
     .unwrap()
 }
 
-fn translate_raw(body: &Value, lite: bool) -> ResponsesRequest {
-    translate_req(&serde_json::from_value(body.clone()).unwrap(), lite)
+fn translate_raw(body: &Value, full_lane: bool) -> ResponsesRequest {
+    translate_req(&serde_json::from_value(body.clone()).unwrap(), full_lane)
 }
 
 fn wire(r: &ResponsesRequest) -> Value {
     serde_json::to_value(r).unwrap()
 }
 
-fn translate(body: &Value, lite: bool) -> Value {
-    wire(&translate_raw(body, lite))
+fn translate(body: &Value, full_lane: bool) -> Value {
+    wire(&translate_raw(body, full_lane))
 }
 
 fn items(w: &Value) -> Vec<String> {
@@ -306,7 +330,8 @@ fn items(w: &Value) -> Vec<String> {
         .collect()
 }
 
-/// First input item of `prev` not reproduced in `cur`; `None` iff prev is an item prefix.
+/// Index of the first input item of `prev` whose canonical JSON differs in `cur`;
+/// `None` iff prev's items are a canonical-JSON item prefix of cur's.
 fn first_diff(prev: &Value, cur: &Value) -> Option<usize> {
     let (p, c) = (items(prev), items(cur));
     p.iter()
@@ -345,12 +370,16 @@ fn tool_names(tools: &Value) -> Vec<String> {
 #[test]
 fn full_lane_pairwise_prefix_facts() {
     let _env = Hermetic::new();
-    let t = |b: Value| translate(&b, false);
+    let t = |b: Value| translate(&b, true);
     let n = t(main_request(0));
     let n1 = t(main_request(1));
     let sub = t(subagent_request(false));
+    let sub_later = t(subagent_request(true));
     let load = t(main_request(2));
-    let comp = t(compaction_request(2, SUMMARIZER_PROMPT));
+    let comp_msg = t(compaction_request(2, Compact::Message));
+    let comp_sys = t(compaction_request(2, Compact::SystemMarker));
+
+    assert!(n.get("instructions").is_some() && n.get("tools").is_some());
 
     assert_strict_prefix(&n, &n1, "main N -> N+1");
     assert_eq!(changed_fields(&n, &n1), set(&["input"]));
@@ -359,13 +388,24 @@ fn full_lane_pairwise_prefix_facts() {
     assert_ne!(n1["instructions"], sub["instructions"]);
     assert_ne!(n1["tools"], sub["tools"]);
 
+    assert_strict_prefix(&sub, &sub_later, "subagent later turn");
+    assert_eq!(changed_fields(&sub, &sub_later), set(&["input"]));
+
     assert_strict_prefix(&n1, &load, "tool load");
     assert_eq!(changed_fields(&n1, &load), set(&["input", "tools"]));
 
-    assert_strict_prefix(&load, &comp, "compaction");
     // `reasoning` is the compaction effort cap, not prompt content.
+    assert_compaction_detected(&load, &comp_msg, "message form");
+    assert_strict_prefix(&load, &comp_msg, "message form");
     assert_eq!(
-        changed_fields(&load, &comp),
+        changed_fields(&load, &comp_msg),
+        set(&["input", "reasoning"])
+    );
+
+    assert_compaction_detected(&load, &comp_sys, "system-marker form");
+    assert_strict_prefix(&load, &comp_sys, "system-marker form");
+    assert_eq!(
+        changed_fields(&load, &comp_sys),
         set(&["input", "instructions", "reasoning"])
     );
 }
@@ -373,15 +413,15 @@ fn full_lane_pairwise_prefix_facts() {
 #[test]
 fn lite_lane_pairwise_prefix_facts() {
     let _env = Hermetic::new();
-    assert!(uses_responses_lite_with_full_lane(MODEL, false));
-    let t = |b: Value| translate(&b, true);
+    let t = |b: Value| translate(&b, false);
     let n = t(main_request(0));
     let n1 = t(main_request(1));
     let sub = t(subagent_request(false));
     let sub_later = t(subagent_request(true));
     let load = t(main_request(2));
     let after_load = t(main_request(3));
-    let comp = t(compaction_request(3, MAIN_PROMPT));
+    let comp_msg = t(compaction_request(3, Compact::Message));
+    let comp_sys = t(compaction_request(3, Compact::SystemMarker));
 
     assert!(n.get("instructions").is_none() && n.get("tools").is_none());
     assert_eq!(n["input"][0]["type"], "additional_tools");
@@ -395,14 +435,26 @@ fn lite_lane_pairwise_prefix_facts() {
     assert_strict_prefix(&sub, &sub_later, "subagent later turn");
     assert_strict_prefix(&n1, &load, "ToolSearch load");
     assert_strict_prefix(&load, &after_load, "after load");
-    assert_strict_prefix(&after_load, &comp, "compaction request");
-
     assert_eq!(first_diff(&n1, &sub), Some(0));
+
+    assert_compaction_detected(&after_load, &comp_msg, "message form");
+    assert_strict_prefix(&after_load, &comp_msg, "message form");
+    assert_eq!(after_load["input"][0], comp_msg["input"][0]);
+    assert_eq!(after_load["input"][1], comp_msg["input"][1]);
+
+    // The summarizer prompt replaces the developer message; tools are untouched.
+    assert_compaction_detected(&after_load, &comp_sys, "system-marker form");
+    assert_eq!(first_diff(&after_load, &comp_sys), Some(1));
+    assert_eq!(after_load["input"][0], comp_sys["input"][0]);
+    assert_ne!(after_load["input"][1], comp_sys["input"][1]);
 }
 
 #[test]
 fn translation_is_deterministic_and_drops_anthropic_cache_fields() {
     let _env = Hermetic::new();
+    // The lane choice is real: the full-lane flag moves MODEL off Lite.
+    assert!(uses_responses_lite_with_full_lane(MODEL, false));
+    assert!(!uses_responses_lite_with_full_lane(MODEL, true));
     let fixtures = [
         main_request(0),
         main_request(1),
@@ -410,17 +462,17 @@ fn translation_is_deterministic_and_drops_anthropic_cache_fields() {
         main_request(3),
         subagent_request(false),
         subagent_request(true),
-        compaction_request(3, MAIN_PROMPT),
-        compaction_request(2, SUMMARIZER_PROMPT),
+        compaction_request(3, Compact::Message),
+        compaction_request(2, Compact::SystemMarker),
         post_compaction_request(true),
     ];
-    for lite in [false, true] {
+    for full_lane in [true, false] {
         for (i, body) in fixtures.iter().enumerate() {
-            let label = format!("lite={lite} fixture={i}");
-            let a = serde_json::to_string(&translate(body, lite)).unwrap();
+            let label = format!("full_lane={full_lane} fixture={i}");
+            let a = serde_json::to_string(&translate(body, full_lane)).unwrap();
             assert_eq!(
                 a,
-                serde_json::to_string(&translate(body, lite)).unwrap(),
+                serde_json::to_string(&translate(body, full_lane)).unwrap(),
                 "{label}"
             );
             for needle in [
@@ -436,7 +488,7 @@ fn translation_is_deterministic_and_drops_anthropic_cache_fields() {
             strip_cache_control(&mut bare);
             assert_eq!(
                 a,
-                serde_json::to_string(&translate(&bare, lite)).unwrap(),
+                serde_json::to_string(&translate(&bare, full_lane)).unwrap(),
                 "{label}"
             );
         }
@@ -448,17 +500,17 @@ fn translation_is_deterministic_and_drops_anthropic_cache_fields() {
         let from_text = |tool: &str| {
             let req: MessagesRequest =
                 serde_json::from_str(&templ.replace("\"__TOOL0__\"", tool)).unwrap();
-            serde_json::to_string(&translate_req(&req, lite)).unwrap()
+            serde_json::to_string(&translate_req(&req, full_lane)).unwrap()
         };
         assert_eq!(
             from_text(BASH_TOOL),
             from_text(BASH_TOOL_PERMUTED),
-            "lite={lite}"
+            "full_lane={full_lane}"
         );
     }
 
-    let full = translate(&main_request(1), false);
-    let lite = translate(&main_request(1), true);
+    let full = translate(&main_request(1), true);
+    let lite = translate(&main_request(1), false);
     assert_eq!(full["prompt_cache_key"], CACHE_KEY);
     assert_eq!(full["prompt_cache_key"], lite["prompt_cache_key"]);
 }
@@ -472,8 +524,8 @@ fn known_proxy_induced_prefix_perturbations() {
         (true, "fake-session-replay-load"),
     ] {
         let pre = translate_raw(
-            &compaction_request(if loaded { 3 } else { 1 }, MAIN_PROMPT),
-            true,
+            &compaction_request(if loaded { 3 } else { 1 }, Compact::Message),
+            false,
         );
         let attempt = begin_compaction(session, MODEL);
         let native = vec![
@@ -500,7 +552,7 @@ fn known_proxy_induced_prefix_perturbations() {
             MODEL,
             &output
         ));
-        let post = translate_raw(&post_compaction_request(loaded), true);
+        let post = translate_raw(&post_compaction_request(loaded), false);
         let replay = apply_compaction_replay(Some(session), &post)
             .expect("replay applies")
             .request;
@@ -529,11 +581,11 @@ fn known_proxy_induced_prefix_perturbations() {
     m.push(user_text("fake next"));
     let body = request(system(1, MAIN_PROMPT), main_tools(false), m);
 
-    let before = translate(&body, true);
+    let before = translate(&body, false);
     for i in 0..4_100 {
         let _ = sanitize_read_args("Read", args, Some(&format!("evict-{i}")));
     }
-    let after = translate(&body, true);
+    let after = translate(&body, false);
     assert!(
         before["input"]
             .to_string()
