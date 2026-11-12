@@ -38,11 +38,22 @@ Claude Code's `/effort` value maps to Codex `reasoning.effort`: `low`, `medium`,
 
 When reasoning is enabled, the proxy requests an automatic reasoning summary and translates summary deltas into Claude Code thinking blocks. Codex may omit a summary for a simple prompt. `CCP_CODEX_REASONING_SUMMARY=off` suppresses summaries while preserving effort and encrypted continuation content.
 
+Detected auto-review classifier requests routed to Codex default to `low` reasoning effort. A valid explicit `output_config.effort` takes precedence over `CCP_CODEX_EFFORT` / `codex.effort`, which takes precedence over that default. Normal requests retain the proxy override's precedence over request effort. Classifier requests do not request reasoning summaries or encrypted reasoning content; their prompt, stop sequences and verdict handling are unchanged.
+
 Claude Code summary compaction requests are capped at low effort by default because they perform extraction over a large transcript. `CCP_COMPACT_EFFORT=off` disables the cap, `none` removes reasoning, and another valid effort sets a different maximum. The cap never raises effort.
 
 ## Tools and multimodal input
 
 - Claude function tools and tool results map to Responses API function calls and outputs.
+- With Claude Code's tool search on (`ENABLE_TOOL_SEARCH=true`, see [Configure Claude Code](/using/configure-claude-code/#mcp-tool-search)),
+  a deferred tool reaches the model once `ToolSearch` loads it. On the Responses
+  Lite lane, the proxy appends each loaded tool as its own `additional_tools` item
+  right after the result that loaded it, as Codex's incremental tools do, so
+  earlier input is not rewritten by a load. Deferred tools
+  with no load in the visible history, such as tools loaded before a compaction,
+  stay in the leading tool list. `tool_reference` blocks render as
+  `Tool loaded: <name>`, and Claude Code's `DeferredToolPlaceholder` stub is not
+  forwarded. On the full Responses lane, tools are sent in the `tools` array as before.
 - Claude Code's forced `web_search_20250305` subrequest uses Codex's standalone
   `/alpha/search` endpoint. It keeps the resolved model, omits search reasoning,
   and preserves non-empty domain filters, so Luna searches do not require a Sol
@@ -119,6 +130,8 @@ While the native request is active, the monitor shows `compacting`. Structured l
 - `session` (default): the Claude Code session id, shared by the main thread and its subagents.
 - `thread`: the main thread keeps the session id. A subagent request gets a stable key derived with SHA-256 from the session id and agent id, so distinct agent ids (and distinct sessions) get distinct keys. Requests without valid session and agent headers use the session id.
 - `omit`: no `prompt_cache_key` is sent.
+
+Detected auto-review requests routed to Codex prefix the resolved key with `guardian:` to separate the reviewer from the main conversation. In both `session` and `thread` modes this is `guardian:<session id>`: auto-review deliberately has no conversation identity. `omit` still sends no key, and a request without a session id also sends no key.
 
 This is an experiment knob. The effect of `thread` or `omit` on cache hits has not been measured, and `session` stays the default. An empty value is treated as unset; any other invalid value stops `serve` at startup. The `session-id` and `x-client-request-id` headers are unchanged in every mode. The `codex_upstream_request_started` log record reports `promptCacheKeyMode` and `identityKind` (`main`, `agent`, or `none`), never the ids or the key.
 

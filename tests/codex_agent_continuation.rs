@@ -84,6 +84,7 @@ fn configure_environment(config_dir: &Path, upstream_url: &str) -> Vec<EnvGuard>
         "CCP_CODEX_SERVICE_TIER",
         "CCP_CODEX_EFFORT",
         "CCP_CODEX_REASONING_SUMMARY",
+        "CCP_CODEX_PROMPT_CACHE_KEY",
         "CCP_CODEX_ORIGINATOR",
         "CCP_CODEX_USER_AGENT",
         "CCP_USER_AGENT",
@@ -1436,6 +1437,132 @@ async fn malformed_identity_sandwich_is_stateless_and_preserves_main() {
     harness.shutdown().await;
 }
 
+#[test]
+fn classifier_translation_defaults_preserve_normal_bodies() {
+    use claude_code_proxy::anthropic::schema::MessagesRequest;
+    use claude_code_proxy::providers::codex::translate::request::{
+        TranslateOptions, translate_request,
+    };
+
+    let _environment_lock = env_lock();
+    let config = TempDir::new().unwrap();
+    let _environment = configure_environment(config.path(), "http://127.0.0.1:1");
+    for (request_effort, global_effort, classifier_effort, normal_effort) in [
+        (None, None, "low", None),
+        (Some("high"), None, "high", Some("high")),
+        (None, Some("xhigh"), "xhigh", Some("xhigh")),
+        (Some("high"), Some("xhigh"), "high", Some("xhigh")),
+        (None, Some("none"), "none", Some("none")),
+    ] {
+        let _effort = match global_effort {
+            Some(effort) => EnvGuard::set("CCP_CODEX_EFFORT", effort),
+            None => EnvGuard::unset("CCP_CODEX_EFFORT"),
+        };
+        for mode in ["session", "thread", "omit"] {
+            for session in [Some("synthetic-session"), None] {
+                // Auto-review has no conversation identity, so thread mode resolves to session.
+                let key = session.filter(|_| mode != "omit").map(str::to_owned);
+                for lite in [false, true] {
+                    for model in ["gpt-6-luna", "gpt-6.1-sol", "gpt-5.6-terra"] {
+                        let mut source = json!({
+                            "model": model,
+                            "codex_auto_review": true,
+                            "max_tokens": 64,
+                            "messages": [{"role": "user", "content": "synthetic command"}],
+                            "thinking": {"type": "disabled"},
+                            "stop_sequences": ["</severity>"]
+                        });
+                        if let Some(effort) = request_effort {
+                            source["output_config"] = json!({"effort": effort});
+                        }
+                        let mut request: MessagesRequest = serde_json::from_value(source).unwrap();
+                        assert!(!request.codex_auto_review);
+                        let options = || TranslateOptions {
+                            prompt_cache_key: key.clone(),
+                            service_tier: None,
+                            model: model.to_string(),
+                            use_responses_lite: lite,
+                        };
+                        let mut expected = json!({
+                            "model": model,
+                            "input": [{"type": "message", "role": "user", "content": [
+                                {"type": "input_text", "text": "synthetic command"}
+                            ]}],
+                            "store": false,
+                            "stream": true,
+                            "parallel_tool_calls": !lite,
+                            "text": {"verbosity": "low"}
+                        });
+                        if let Some(key) = &key {
+                            expected["prompt_cache_key"] = json!(key);
+                        }
+                        if lite {
+                            expected["client_metadata"] = json!({
+                                "ws_request_header_x_openai_internal_codex_responses_lite": "true"
+                            });
+                        }
+                        if normal_effort.is_some() || lite {
+                            let mut reasoning = json!({});
+                            if let Some(effort) = normal_effort {
+                                reasoning["effort"] = json!(effort);
+                                if effort != "none" {
+                                    reasoning["summary"] = json!("auto");
+                                    expected["include"] = json!(["reasoning.encrypted_content"]);
+                                }
+                            }
+                            if lite {
+                                reasoning["context"] = json!("all_turns");
+                            }
+                            expected["reasoning"] = reasoning;
+                        }
+                        let normal = translate_request(&request, options()).unwrap();
+                        assert_eq!(
+                            serde_json::to_vec(&serde_json::to_value(normal).unwrap()).unwrap(),
+                            serde_json::to_vec(&expected).unwrap(),
+                            "normal body: {model}/{mode}/{session:?}/lite={lite}"
+                        );
+                        request.codex_auto_review = true;
+                        let classifier = translate_request(&request, options()).unwrap();
+                        let body = serde_json::to_value(classifier).unwrap();
+                        assert_eq!(body["reasoning"]["effort"], classifier_effort);
+                        assert!(body["reasoning"].get("summary").is_none());
+                        assert!(body.get("include").is_none());
+                        assert_eq!(body["parallel_tool_calls"], !lite);
+                        assert_eq!(
+                            body["reasoning"].get("context"),
+                            lite.then_some(&json!("all_turns"))
+                        );
+                        assert_eq!(
+                            body.get("prompt_cache_key")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            key.as_ref().map(|key| format!("guardian:{key}"))
+                        );
+                        assert_eq!(request.extra["stop_sequences"], json!(["</severity>"]));
+                        assert_eq!(request.extra["thinking"], json!({"type": "disabled"}));
+                        request.extra.insert(
+                            "system".into(),
+                            json!([{"type": "text", "text": concat!(
+                                "You are a security monitor for autonomous AI coding agents.\n",
+                                "You are a helpful AI assistant tasked with summarizing conversations"
+                            )}]),
+                        );
+                        let classifier = translate_request(&request, options()).unwrap();
+                        assert_eq!(
+                            serde_json::to_value(classifier).unwrap()["reasoning"]["effort"],
+                            classifier_effort
+                        );
+                        request
+                            .extra
+                            .insert("output_config".into(), json!({"effort": "invalid"}));
+                        assert!(translate_request(&request, options()).is_err());
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_review_with_agent_headers_is_stateless() {
@@ -1502,11 +1629,55 @@ async fn auto_review_with_agent_headers_is_stateless() {
         &[("developer", review_system), ("user", &review)],
     );
     assert_eq!(classifier.body["model"], "gpt-6-luna");
+    assert_eq!(classifier.body["reasoning"]["effort"], "low");
+    assert_eq!(
+        classifier.body["prompt_cache_key"],
+        format!("guardian:{session}")
+    );
+    assert!(classifier.body["reasoning"].get("summary").is_none());
+    assert!(classifier.body.get("include").is_none());
     assert_eq!(first.socket_ordinal, 1);
     assert_eq!(classifier.socket_ordinal, 2);
     assert_delta_input(&second, &a_response, first.socket_ordinal, &a2);
     assert_ne!(classifier.socket_ordinal, second.socket_ordinal);
     assert_eq!(harness.upstream.snapshot().len(), 3);
+    for mode in ["session", "thread", "omit"] {
+        let _mode = EnvGuard::set("CCP_CODEX_PROMPT_CACHE_KEY", mode);
+        for model in ["gpt-6.1-sol", "gpt-5.6-luna"] {
+            let marker = format!("{review}-{mode}-{model}");
+            let classifier = harness
+                .round_trip(
+                    json!({
+                        "model": model,
+                        "max_tokens": 64,
+                        "stream": false,
+                        "system": [{"type": "text", "text": review_system}],
+                        "messages": [{"role": "user", "content": marker}],
+                        "tools": [],
+                        "stop_sequences": ["</severity>"],
+                        "thinking": {"type": "disabled"}
+                    }),
+                    IdentityHeaders::agent(&session, "agent-a", None),
+                    &marker,
+                    &format!("resp-{mode}-{model}"),
+                    "<severity>low</severity>",
+                )
+                .await;
+            assert_eq!(classifier.body["model"], "gpt-6-luna");
+            assert_eq!(classifier.body["reasoning"]["effort"], "low");
+            if mode == "omit" {
+                assert!(classifier.body.get("prompt_cache_key").is_none());
+            } else {
+                assert_eq!(
+                    classifier.body["prompt_cache_key"],
+                    format!("guardian:{session}")
+                );
+            }
+            assert!(classifier.body["reasoning"].get("summary").is_none());
+            assert!(classifier.body.get("include").is_none());
+            assert!(classifier.body.get("previous_response_id").is_none());
+        }
+    }
     harness.shutdown().await;
 }
 
