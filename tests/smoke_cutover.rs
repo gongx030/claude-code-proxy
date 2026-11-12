@@ -958,11 +958,17 @@ async fn spawn_websocket_always_empty_completion_upstream(
 }
 
 // ---------------------------------------------------------------------------
-// Health and routing smoke tests (no env var mutation needed)
+// Health and routing smoke tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn smoke_healthz_returns_ok() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _home_env = EnvGuard::set("HOME", config.path());
+    let _flag_env = EnvGuard::unset("CCP_CODEX_AUTH_READONLY");
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
         .oneshot(
@@ -982,8 +988,8 @@ async fn smoke_healthz_returns_ok() {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap();
     assert_eq!(body["ok"], json!(true));
-    assert!(body.get("codex_auth_mode").is_some());
-    assert!(body.get("codex_auth_expires_in_s").is_some());
+    assert_eq!(body["codex_auth_mode"], json!("read_write"));
+    assert!(body["codex_auth_expires_in_s"].is_null());
 }
 
 #[tokio::test]

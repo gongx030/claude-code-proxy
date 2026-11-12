@@ -817,11 +817,16 @@ pub fn codex_full_lane() -> bool {
 }
 
 /// Whether this listener must only read the Codex token store (never refresh,
-/// save or clear it). Env wins over file. Unlike the lenient lane flags, an
-/// unrecognized env value is an error so a typo cannot silently leave the
-/// listener read-write.
+/// save or clear it). Env wins over file. Unlike the lenient lane flags, this
+/// fails closed: a non-Unicode or unrecognized env value, and an unreadable or
+/// unparseable config file (or a non-boolean `codex.authReadOnly`), are errors
+/// so a typo or corrupt file cannot silently leave the listener read-write.
+/// Only a missing config file means "not set".
 pub fn codex_auth_read_only() -> anyhow::Result<bool> {
-    if let Ok(raw) = std::env::var("CCP_CODEX_AUTH_READONLY") {
+    if let Some(raw) = std::env::var_os("CCP_CODEX_AUTH_READONLY") {
+        let Some(raw) = raw.to_str() else {
+            anyhow::bail!("invalid CCP_CODEX_AUTH_READONLY value {raw:?}: not valid Unicode");
+        };
         return match raw.trim() {
             "" | "0" => Ok(false),
             "1" => Ok(true),
@@ -830,8 +835,27 @@ pub fn codex_auth_read_only() -> anyhow::Result<bool> {
             ),
         };
     }
-    Ok(read_file_config(&paths::config_dir())
-        .and_then(|file| file.codex)
+    codex_auth_read_only_from_file(&paths::config_dir())
+}
+
+fn codex_auth_read_only_from_file(config_dir: &Path) -> anyhow::Result<bool> {
+    let path = config_dir.join("config.json");
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => anyhow::bail!(
+            "cannot read {} to resolve codex.authReadOnly: {err}",
+            path.display()
+        ),
+    };
+    let file: FileConfig = serde_json::from_str(&raw).map_err(|err| {
+        anyhow::anyhow!(
+            "cannot parse {} to resolve codex.authReadOnly: {err}",
+            path.display()
+        )
+    })?;
+    Ok(file
+        .codex
         .and_then(|codex| codex.auth_read_only)
         .unwrap_or(false))
 }
@@ -1468,6 +1492,40 @@ mod tests {
             let err = codex_auth_read_only().unwrap_err().to_string();
             assert!(err.contains("CCP_CODEX_AUTH_READONLY"), "{value:?}: {err}");
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let _flag = EnvGuard::set(
+                "CCP_CODEX_AUTH_READONLY",
+                std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+            );
+            let err = codex_auth_read_only().unwrap_err().to_string();
+            assert!(err.contains("not valid Unicode"), "{err}");
+        }
+    }
+
+    #[test]
+    fn codex_auth_read_only_fails_closed_on_bad_config_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        let file = config.path().join("config.json");
+        for raw in [
+            "{not json",
+            r#"{"codex":{"authReadOnly":"true"}}"#,
+            r#"{"codex":{"authReadOnly":1}}"#,
+        ] {
+            std::fs::write(&file, raw).unwrap();
+            let err = codex_auth_read_only().unwrap_err().to_string();
+            assert!(err.contains("codex.authReadOnly"), "{raw}: {err}");
+        }
+        // An unreadable path (a directory) is an error, not "unset".
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(codex_auth_read_only().is_err());
+        // Only a missing file means "not set".
+        std::fs::remove_dir(&file).unwrap();
+        assert!(!codex_auth_read_only().unwrap());
     }
 
     #[test]

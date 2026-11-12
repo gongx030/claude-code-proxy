@@ -426,10 +426,41 @@ async fn invalid_bind_address_is_actionable() {
     assert!(err.contains("not-an-ip"));
 }
 
-#[tokio::test]
-async fn healthz_returns_ok() {
-    let app = app(Arc::new(Registry::with_default_alias()));
-    let response = app
+/// Restores an env var (set or unset) when dropped.
+struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+
+impl EnvRestore {
+    fn set(key: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        Self(key, previous)
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        unsafe {
+            match self.1.take() {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+}
+
+async fn healthz_body(config_dir: &std::path::Path, read_only_env: Option<&str>) -> Value {
+    let _config = EnvRestore::set("CCP_CONFIG_DIR", Some(config_dir.as_os_str()));
+    let _home = EnvRestore::set("HOME", Some(config_dir.as_os_str()));
+    let _flag = EnvRestore::set(
+        "CCP_CODEX_AUTH_READONLY",
+        read_only_env.map(std::ffi::OsStr::new),
+    );
+    let response = app(Arc::new(Registry::with_default_alias()))
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -439,20 +470,29 @@ async fn healthz_returns_ok() {
         )
         .await
         .unwrap();
-
     assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+    axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap();
-    assert_eq!(body["ok"], json!(true));
-    assert!(matches!(
-        body["codex_auth_mode"].as_str(),
-        Some("read_write" | "read_only")
-    ));
-    assert!(body["codex_auth_expires_in_s"].is_null() || body["codex_auth_expires_in_s"].is_i64());
-    assert_eq!(body.as_object().unwrap().len(), 3);
+        .unwrap()
+}
+
+// Runs against an isolated empty config dir so it never reads the developer's
+// real config or token store.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn healthz_reports_auth_mode_against_an_isolated_store() {
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let config = tempfile::TempDir::new().unwrap();
+    for (flag, mode) in [(None, "read_write"), (Some("1"), "read_only")] {
+        let body = healthz_body(config.path(), flag).await;
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["codex_auth_mode"], json!(mode), "{flag:?}");
+        assert!(body["codex_auth_expires_in_s"].is_null(), "{flag:?}");
+        assert_eq!(body.as_object().unwrap().len(), 3);
+    }
 }
 
 #[tokio::test]

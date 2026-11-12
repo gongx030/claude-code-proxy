@@ -19,21 +19,7 @@ const READ_ONLY_MIN_VALIDITY_MS: u64 = 60_000;
 
 const READ_ONLY_EXPIRED_MESSAGE: &str = "codex auth is read-only: stored token is expired or expires within 60s; the listener that owns this store must refresh it";
 
-/// Mode and remaining token lifetime for `/healthz`. Reads the store only; the
-/// result never contains a token, account id or path.
-pub fn auth_health<S: AuthStorage<StoredAuth>>(
-    store: &CodexTokenStore<S>,
-    read_only: bool,
-    now_ms: u64,
-) -> (&'static str, Option<i64>) {
-    let mode = if read_only { "read_only" } else { "read_write" };
-    let expires_in_s = store
-        .load_auth()
-        .ok()
-        .flatten()
-        .map(|auth| (i128::from(auth.expires) - i128::from(now_ms)).div_euclid(1000) as i64);
-    (mode, expires_in_s)
-}
+const READ_ONLY_LOGIN_MESSAGE: &str = "Not authenticated: codex auth is read-only and refuses login; the listener that owns this store must log in";
 
 pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     pub store: CodexTokenStore<S>,
@@ -61,6 +47,34 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         self.read_only
     }
 
+    /// Mode and remaining token lifetime for `/healthz`, from this manager's
+    /// own mode. Reads the store only (blocking disk I/O: call it from
+    /// `spawn_blocking`); the result never contains a token, account id or
+    /// path. A store read error is logged and reported as `None`.
+    pub fn health(&self, now_ms: u64) -> (&'static str, Option<i64>) {
+        let mode = if self.read_only {
+            "read_only"
+        } else {
+            "read_write"
+        };
+        let expires_in_s = match self.store.load_auth() {
+            Ok(auth) => auth.map(|auth| {
+                (i128::from(auth.expires) - i128::from(now_ms)).div_euclid(1000) as i64
+            }),
+            Err(err) => {
+                crate::logging::create_logger("codex").warn(
+                    "codex_auth_health_store_read_failed",
+                    Some(serde_json::Map::from_iter([(
+                        "error".to_string(),
+                        serde_json::json!(err.to_string()),
+                    )])),
+                );
+                None
+            }
+        };
+        (mode, expires_in_s)
+    }
+
     fn new_with_token_endpoint(store: CodexTokenStore<S>, token_endpoint: String) -> Self {
         Self {
             read_only: false,
@@ -86,7 +100,11 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
 
     pub async fn get_auth(&self) -> Result<StoredAuth, anyhow::Error> {
         let stored = self.load_auth()?.ok_or_else(|| {
-            anyhow::anyhow!("Not authenticated. Run: claude-code-proxy codex auth login")
+            if self.read_only {
+                anyhow::anyhow!(READ_ONLY_LOGIN_MESSAGE)
+            } else {
+                anyhow::anyhow!("Not authenticated. Run: claude-code-proxy codex auth login")
+            }
         })?;
 
         if self.read_only {
@@ -465,7 +483,16 @@ mod tests {
         let expired_message = "codex auth is read-only: stored token is expired or expires within 60s; the listener that owns this store must refresh it";
 
         // get_auth: fresh is served; near-expiry and expired are refused.
-        for (expires, served) in [(now + 3_600_000, true), (now + 30_000, false), (0, false)] {
+        // The clock only moves forward, so `now + 60s` sampled earlier is at
+        // most exactly 60s ahead at check time and must be refused; 5s above
+        // the boundary stays accepted unless the test stalls for 5s.
+        for (expires, served) in [
+            (now + 3_600_000, true),
+            (now + READ_ONLY_MIN_VALIDITY_MS + 5_000, true),
+            (now + READ_ONLY_MIN_VALIDITY_MS, false),
+            (now + 30_000, false),
+            (0, false),
+        ] {
             backing.save(auth_with("stored", expires)).unwrap();
             let result = manager.get_auth().await;
             assert_eq!(result.is_ok(), served, "expires={expires}");
@@ -486,6 +513,16 @@ mod tests {
             "rotated"
         );
 
+        // After a 401 the 60s margin does not apply: a rotated token valid
+        // for only 30s is accepted, per the contract (unexpired + changed).
+        backing
+            .save(auth_with("rotated-30s", now + 30_000))
+            .unwrap();
+        assert_eq!(
+            manager.force_refresh("stored").await.unwrap().access,
+            "rotated-30s"
+        );
+
         // A rotated but already-expired token is refused too.
         backing.save(auth_with("rotated-expired", 0)).unwrap();
         assert!(manager.force_refresh("stored").await.is_err());
@@ -504,19 +541,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn read_only_empty_store_errors_without_writes() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let spy = SpyStore {
+            inner: InMemoryAuthStore::new(),
+            writes: writes.clone(),
+        };
+        let manager = CodexAuthManager::new_with_token_endpoint(
+            CodexTokenStore::new(spy),
+            "http://127.0.0.1:1/should-not-be-called".into(),
+        )
+        .with_read_only(true);
+
+        let err = manager.get_auth().await.unwrap_err().to_string();
+        assert_eq!(err, READ_ONLY_LOGIN_MESSAGE);
+        assert!(manager.force_refresh("any").await.is_err());
+        assert_eq!(writes.load(Ordering::SeqCst), 0, "store writes or clears");
+    }
+
     #[test]
-    fn auth_health_reports_mode_and_signed_seconds_to_expiry() {
-        let store = test_store();
-        assert_eq!(auth_health(&store, false, 1_000_000), ("read_write", None));
-        store.save_auth(auth_with("a", 1_061_500)).unwrap();
-        assert_eq!(
-            auth_health(&store, true, 1_000_000),
-            ("read_only", Some(61))
-        );
-        assert_eq!(
-            auth_health(&store, false, 1_070_000),
-            ("read_write", Some(-9))
-        );
+    fn health_reports_own_mode_and_signed_seconds_to_expiry() {
+        let read_write = CodexAuthManager::new(test_store());
+        assert_eq!(read_write.health(1_000_000), ("read_write", None));
+        read_write
+            .store
+            .save_auth(auth_with("a", 1_061_500))
+            .unwrap();
+        assert_eq!(read_write.health(1_070_000), ("read_write", Some(-9)));
+
+        let read_only = CodexAuthManager::new(test_store()).with_read_only(true);
+        read_only
+            .store
+            .save_auth(auth_with("a", 1_061_500))
+            .unwrap();
+        assert_eq!(read_only.health(1_000_000), ("read_only", Some(61)));
     }
 
     #[tokio::test]
