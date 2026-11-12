@@ -18,6 +18,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-luna",
     "gpt-6-sol",
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -131,7 +132,28 @@ pub fn uses_responses_lite(model: &str) -> bool {
             | "gpt-6-luna"
             | "gpt-6-sol"
             | "gpt-6.1-sol"
+            | "gpt-6.1-terra"
     )
+}
+
+/// Opt the six known Sol/Terra/Astra models out of Lite when the full lane is
+/// enabled. Luna exists only on Lite and stays there; other models keep the
+/// lane `uses_responses_lite` declares. Ported from upstream adbec95.
+pub fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
+    if full_lane
+        && matches!(
+            model,
+            "gpt-5.6-sol"
+                | "gpt-5.6-terra"
+                | "gpt-6-astra"
+                | "gpt-6-sol"
+                | "gpt-6.1-sol"
+                | "gpt-6.1-terra"
+        )
+    {
+        return false;
+    }
+    uses_responses_lite(model)
 }
 
 /// Luna models exist only behind the Responses Lite lane; the full
@@ -165,6 +187,29 @@ mod tests {
     fn haiku_resolves_to_luna() {
         let r = resolve_model_request("haiku");
         assert_eq!(r.model, "gpt-6-luna");
+    }
+
+    #[test]
+    fn full_lane_covers_all_lite_models_except_luna() {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+        ] {
+            assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
+            assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
+        for model in ["gpt-5.6-luna", "gpt-6-luna"] {
+            assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
+            assert!(uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
+        for model in ["gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"] {
+            assert!(!uses_responses_lite_with_full_lane(model, false), "{model}");
+            assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
     }
 
     #[test]
@@ -242,6 +287,18 @@ mod tests {
         assert!(assert_allowed_model("gpt-6-astra").is_ok());
         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
         assert!(assert_allowed_model("gpt-6.1-sol").is_ok());
+        assert!(assert_allowed_model("gpt-6.1-terra").is_ok());
+    }
+
+    #[test]
+    fn gpt_6_1_sol_and_terra_are_accepted_with_fast_alias_on_lite() {
+        for model in ["gpt-6.1-sol", "gpt-6.1-terra"] {
+            assert!(assert_allowed_model(model).is_ok(), "{model}");
+            assert!(uses_responses_lite(model), "{model}");
+            let fast = resolve_model_request(&format!("{model}-fast"));
+            assert_eq!(fast.model, model);
+            assert_eq!(fast.service_tier, Some(ServiceTier::Priority));
+        }
     }
 
     #[test]

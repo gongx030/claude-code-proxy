@@ -32,6 +32,12 @@ Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6
 
 Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service. `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence.
 
+## Responses lanes and parallel tools
+
+The gpt-5.6 and gpt-6 families use Responses Lite by default. Lite requires `parallel_tool_calls: false`, so function tools run serially. Set `codex.fullLane: true` or `CCP_CODEX_FULL_LANE=1` to use the full Responses lane for `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`, and `gpt-6.1-terra`. This permits parallel tool calls; the model still decides whether to batch tools, and an explicit client restriction on parallel tools remains effective. `CCP_CODEX_FULL_LANE=0` disables the setting and takes precedence over the config file.
+
+Luna models stay on Lite. Automatic hosted web search uses the full lane regardless of this setting and remaps Luna to its Sol sibling. The setting applies to `/v1/messages`, `/v1/responses` and `/v1/chat/completions`. Auto-review classifier requests keep their low reasoning effort and `guardian:` prompt cache key on both lanes. Full-lane availability and quota accounting depend on the upstream subscription; the setting is opt-in.
+
 ## Reasoning
 
 Claude Code's `/effort` value maps to Codex `reasoning.effort`: `low`, `medium`, `high`, `xhigh`, or `max`. A proxy override can also force `none`.

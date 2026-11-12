@@ -61,6 +61,8 @@ struct CodexConfig {
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
+    #[serde(rename = "fullLane")]
+    pub full_lane: Option<bool>,
     #[serde(rename = "imagesApi")]
     pub images_api: Option<bool>,
     #[serde(rename = "imagesBaseUrl")]
@@ -264,6 +266,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_RESPONSES_API") {
         out.push("codex.responsesApi (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_FULL_LANE") {
+        out.push("codex.fullLane (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_IMAGES_API") {
         out.push("codex.imagesApi (env)".to_string());
     }
@@ -372,6 +377,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
+            }
+            if codex.full_lane == Some(true) {
+                out.push("codex.fullLane: true".to_string());
             }
             if codex.images_api == Some(true) {
                 out.push("codex.imagesApi: true".to_string());
@@ -783,6 +791,23 @@ pub fn codex_prompt_cache_key_mode() -> anyhow::Result<PromptCacheKeyMode> {
     }
 }
 
+/// Whether Sol/Terra/Astra models use the full Responses lane (parallel tool
+/// calls) instead of Responses Lite. Env wins over file; `0` opts out.
+pub fn codex_full_lane() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.full_lane
+    {
+        return enabled;
+    }
+    false
+}
+
 pub fn codex_responses_api() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
@@ -1091,6 +1116,7 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_SERVER_COMPACTION"),
             EnvGuard::unset("CCP_CODEX_PROMPT_CACHE_KEY"),
             EnvGuard::unset("CCP_CODEX_RESPONSES_API"),
+            EnvGuard::unset("CCP_CODEX_FULL_LANE"),
             EnvGuard::unset("CCP_CODEX_IMAGES_API"),
             EnvGuard::unset("CCP_CODEX_IMAGES_BASE_URL"),
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
@@ -1360,6 +1386,35 @@ mod tests {
         assert!(codex_responses_api());
         let _responses_env = EnvGuard::set("CCP_CODEX_RESPONSES_API", "false");
         assert!(!codex_responses_api());
+    }
+
+    #[test]
+    fn codex_full_lane_defaults_off_reads_config_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        assert!(!codex_full_lane());
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_full_lane());
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("yes", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("invalid", false),
+            ("", false),
+        ] {
+            let _flag = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert_eq!(codex_full_lane(), expected, "{value:?}");
+        }
     }
 
     #[test]
