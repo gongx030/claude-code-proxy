@@ -563,7 +563,11 @@ fn translate_request_inner(
         }
     }
 
-    out.prompt_cache_key = opts.prompt_cache_key;
+    out.prompt_cache_key = if req.codex_auto_review {
+        opts.prompt_cache_key.map(|key| format!("guardian:{key}"))
+    } else {
+        opts.prompt_cache_key
+    };
 
     if apply_codex_config {
         let service_tier = resolve_service_tier(opts.service_tier)?;
@@ -574,15 +578,21 @@ fn translate_request_inner(
 
     let effort = read_effort(req)?;
     let codex_effort = to_codex_effort(effort);
-    let mut resolved_effort = if apply_codex_config {
+    let mut resolved_effort = if req.codex_auto_review {
+        match codex_effort {
+            Some(effort) => Some(effort),
+            None if apply_codex_config => resolve_effort(Some(Effort::Low))?,
+            None => Some(Effort::Low),
+        }
+    } else if apply_codex_config {
         resolve_effort(codex_effort)?
     } else {
         codex_effort
     };
-    if apply_codex_config && is_compact {
+    if apply_codex_config && is_compact && !req.codex_auto_review {
         resolved_effort = apply_compact_effort_cap(resolved_effort, compact_effort_cap());
     }
-    let wants_reasoning = reasoning_requested(resolved_effort.as_ref());
+    let wants_reasoning = !req.codex_auto_review && reasoning_requested(resolved_effort.as_ref());
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if wants_reasoning
             && (!apply_codex_config

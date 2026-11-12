@@ -1678,6 +1678,7 @@ async fn dispatch_request(
     };
 
     body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
+    body.codex_auto_review = auto_review_route.is_some() && provider.name() == "codex";
 
     if let Some(route) = auto_review_route.as_ref() {
         log.info(
